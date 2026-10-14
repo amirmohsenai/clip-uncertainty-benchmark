@@ -1,0 +1,63 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction and Scope}{2}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Project Structure and Software Dependencies}{3}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Repository File Inventory}{3}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}External Software and Dataset Dependencies}{4}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Overall Implementation Workflow}{4}{section.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Software libraries imported by the implementation and their functional roles.}}{5}{table.1}\protected@file@percent }
+\newlabel{tab:dependencies}{{1}{5}{Software libraries imported by the implementation and their functional roles}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Input Data and Preparation}{6}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Dataset Specifications and Storage Layout}{6}{subsection.4.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Datasets used in the implementation, their shapes, and their experimental roles.}}{6}{table.2}\protected@file@percent }
+\newlabel{tab:datasets}{{2}{6}{Datasets used in the implementation, their shapes, and their experimental roles}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Verification, Slicing, and Preprocessing}{7}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Main Components}{7}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Utility, Split, and Prompt Components (Sections 2--7)}{7}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Inference, Calibration, and Metric Components (Sections 9--16)}{8}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Model and Algorithm Implementation}{9}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Zero-Shot CLIP Similarity and Base Probabilities}{9}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Base Confidence and Uncertainty Scores (\texttt  {MSP}, \texttt  {entropy}, \texttt  {margin})}{9}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Post-Hoc Temperature Scaling (\texttt  {temperature\_\allowbreak  {}MSP})}{9}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Multi-Prompt Agreement and Instability (\texttt  {prompt\_\allowbreak  {}agreement})}{10}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Split-Conformal Prediction Sets (\texttt  {conformal\_\allowbreak  {}set\_\allowbreak  {}size})}{10}{subsection.6.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Calibration and Inference Processing Procedure}{11}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Two-Stage Caching Architecture}{11}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Per-Seed Calibration and Evaluation Workflow}{11}{subsection.7.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Configuration parameters in \texttt  {CONFIG}, their types, values, and effects.}}{12}{table.3}\protected@file@percent }
+\newlabel{tab:config}{{3}{12}{Configuration parameters in \texttt {CONFIG}, their types, values, and effects}{table.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Configuration and Parameter Handling}{13}{section.8}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Experiment families \texttt  {E1}--\texttt  {E10} and their expansion in \texttt  {FULL\_\allowbreak  {}MATRIX}.}}{13}{table.4}\protected@file@percent }
+\newlabel{tab:experiments}{{4}{13}{Experiment families \texttt {E1}--\texttt {E10} and their expansion in \texttt {FULL\_\allowbreak {}MATRIX}}{table.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Evaluation and Postprocessing Implementation}{13}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}Fixed-Coverage and Risk-Constrained Selective Prediction}{13}{subsection.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}Risk-Coverage Curves, AURC, and EAURC}{14}{subsection.9.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}OOD Discrimination and Calibration Metrics}{14}{subsection.9.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.4}Bootstrap Confidence Intervals and Failure-Case Extraction}{14}{subsection.9.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Output Generation and File Handling}{15}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}Error Handling, Reproducibility, and Execution Considerations}{15}{section.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.1}Validation and Exception Handling}{15}{subsection.11.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.2}Reproducibility Controls}{15}{subsection.11.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Generated output files, formats, and directory locations.}}{16}{table.5}\protected@file@percent }
+\newlabel{tab:outputs}{{5}{16}{Generated output files, formats, and directory locations}{table.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {12}Implementation Limitations}{17}{section.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13}Summary of the Implementation}{17}{section.13}\protected@file@percent }
+\gdef \LT@i {\LT@entry 
+    {1}{143.35764pt}\LT@entry 
+    {1}{129.76915pt}\LT@entry 
+    {1}{175.06871pt}}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Function and Class Interface Reference}{18}{appendix.A}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{Summary of classes and functions defined in the codebase.}}{18}{table.6}\protected@file@percent }
+\newlabel{tab:interfaces}{{6}{18}{Summary of classes and functions defined in the codebase}{table.6}{}}
+\gdef \LT@ii {\LT@entry 
+    {1}{31.97932pt}\LT@entry 
+    {4}{58.41687pt}\LT@entry 
+    {4}{53.9999pt}\LT@entry 
+    {1}{39.20148pt}\LT@entry 
+    {1}{238.48395pt}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Notebook Cell Inventory and Execution Map}{20}{appendix.B}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {7}{Complete cell-by-cell inventory of the 59-cell Jupyter notebook.}}{20}{table.7}\protected@file@percent }
+\newlabel{tab:cells}{{7}{20}{Complete cell-by-cell inventory of the 59-cell Jupyter notebook}{table.7}{}}
+\gdef \@abspage@last{22}

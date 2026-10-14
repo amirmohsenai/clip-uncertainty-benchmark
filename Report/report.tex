@@ -1,0 +1,643 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,citecolor=blue!50!black]{hyperref}
+
+\setlength{\parskip}{5pt plus 2pt minus 1pt}
+\setlength{\parindent}{0pt}
+\sloppy
+\emergencystretch=3em
+\renewcommand{\topfraction}{0.95}
+\renewcommand{\bottomfraction}{0.95}
+\renewcommand{\textfraction}{0.05}
+\renewcommand{\floatpagefraction}{0.85}
+
+\renewcommand{\arraystretch}{1.15}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!25},
+  backgroundcolor=\color{black!3},
+  aboveskip=6pt,
+  belowskip=6pt,
+  showstringspaces=false
+}
+
+\title{\textbf{Technical Implementation Report:\\Conformal-Aware Selective Abstention of Zero-Shot Vision-Language Models under Semantic and Visual Distribution Shift}}
+\author{Software Architecture and Implementation Documentation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the software architecture, mathematical formulations, data pipelines, caching mechanisms, and verification procedures implemented in the project \emph{Conformal-Aware Selective Abstention of Zero-Shot Vision-Language Models under Semantic and Visual Distribution Shift}. The codebase is supplied as a 59-cell Google Colab Jupyter notebook (\texttt{conformal\_\allowbreak{}aware\_\allowbreak{}selective\_\allowbreak{}abstention\_\allowbreak{}clip\_\allowbreak{}colab\_\allowbreak{}persistent\_\allowbreak{}drive.\allowbreak{}ipynb}) and a synchronized Python script (\texttt{conformal\_\allowbreak{}aware\_\allowbreak{}selective\_\allowbreak{}abstention\_\allowbreak{}clip\_\allowbreak{}colab\_\allowbreak{}persistent\_\allowbreak{}drive.\allowbreak{}py}). The implementation evaluates post-hoc calibration, split-conformal prediction set construction, selective abstention, and out-of-distribution (OOD) detection for a frozen, zero-shot OpenAI CLIP \texttt{ViT-B/\allowbreak{}32} classifier operating over the 10-class CIFAR-10 vocabulary. All calibration parameters and selective operating thresholds are estimated strictly on seeded 5,000-sample subsets of the CIFAR-10 training split, while evaluation spans 30 held-out experimental conditions across clean CIFAR-10, prompt-shifted CIFAR-10, six CIFAR-10-C corruption families at three severity levels, CIFAR-100 semantic OOD, and SVHN far OOD. This report explains how each software component is constructed and how data and control flow through the 26-stage pipeline.
+\end{abstract}
+
+\tableofcontents
+\vspace{10pt}
+
+\section{Introduction and Scope}
+
+Zero-shot vision-language models such as CLIP classify images by comparing L2-normalized visual and textual embeddings in a shared representation space without task-specific fine-tuning. When deployed under natural prompt variations, visual corruptions, or semantic category shifts, a frozen zero-shot classifier requires post-hoc mechanisms to quantify predictive uncertainty, calibrate confidence estimates, construct finite-sample prediction sets, and abstain on unreliable or out-of-vocabulary inputs.
+
+The supplied codebase implements a self-contained, restart-capable experimental pipeline designed to evaluate six post-hoc confidence and uncertainty scoring rules on top of a frozen OpenAI CLIP \texttt{ViT-B/\allowbreak{}32} model (\texttt{openai-clip/\allowbreak{}ViT-B/\allowbreak{}32}):
+\begin{enumerate}
+  \item \textbf{Maximum Softmax Probability (\texttt{MSP})}: Uses the top-1 base softmax probability as confidence and $1 - \text{MSP}$ as uncertainty.
+  \item \textbf{Normalized Shannon Entropy (\texttt{entropy})}: Uses $1 - H_{\text{norm}}(p)$ as confidence and normalized entropy $H_{\text{norm}}(p) \in [0, 1]$ as uncertainty.
+  \item \textbf{Probability Margin (\texttt{margin})}: Uses the difference between the largest and second-largest base softmax probabilities ($p_{(1)} - p_{(2)}$) as confidence and $1 - (p_{(1)} - p_{(2)})$ as uncertainty.
+  \item \textbf{Temperature-Scaled MSP (\texttt{temperature\_\allowbreak{}MSP})}: Scales logits by a scalar temperature $T > 0$ fitted via bounded negative log-likelihood (NLL) minimization on the calibration split before computing top-1 softmax probability.
+  \item \textbf{Multi-Prompt Agreement (\texttt{prompt\_\allowbreak{}agreement})}: Evaluates predictions across four semantically equivalent prompt templates (\texttt{P0}--\texttt{P3}), using the majority-vote class as the prediction, the fraction of agreeing prompts as confidence, and prompt instability ($1 - \text{agreement}$) as uncertainty.
+  \item \textbf{Split-Conformal Prediction Set Size (\texttt{conformal\_\allowbreak{}set\_\allowbreak{}size})}: Constructs marginal split-conformal prediction sets $C(x) \subseteq \{0, \dots, 9\}$ at miscoverage level $\alpha = 0.10$ using calibration nonconformity scores $s_i = 1 - p_{\text{base}}(y_i \mid x_i)$, defining confidence as $1 / |C(x)|$ and uncertainty as the cardinal set size $|C(x)|$.
+\end{enumerate}
+
+The implementation enforces four core design invariants throughout all 26 stages:
+\begin{itemize}
+  \item \textbf{Frozen zero-shot backbone}: All parameters of CLIP \texttt{ViT-B/\allowbreak{}32} have \texttt{requires\_\allowbreak{}grad} set to \texttt{False}; no gradient updates or fine-tuning are performed.
+  \item \textbf{Fixed 10-class prediction vocabulary}: Every experimental condition---including CIFAR-100 and SVHN OOD inputs---is scored against the 10 canonical CIFAR-10 class names.
+  \item \textbf{Strict train-only calibration}: Temperature scaling ($T$), split-conformal quantiles ($\hat{q}_{1-\alpha}$), fixed-coverage thresholds, and risk-constrained thresholds are fitted exclusively on 5,000-sample subsets drawn from the 50,000-sample CIFAR-10 training split. Held-out test and OOD splits are never accessed during calibration or threshold selection.
+  \item \textbf{Fingerprinted persistent caching}: Expensive image and text encoding outputs are cached to disk as compressed \texttt{.\allowbreak{}npz} archives paired with canonical JSON metadata files keyed by 16-character SHA-256 configuration fingerprints.
+\end{itemize}
+
+This report focuses strictly on the software design, mathematical definitions, algorithms, data structures, and verification logic present in the codebase. It does not present empirical findings or numerical performance comparisons.
+
+\section{Project Structure and Software Dependencies}
+
+\subsection{Repository File Inventory}
+
+The project is organized around two synchronized source representations of the pipeline and three supporting documentation and audit files:
+\begin{itemize}
+  \item \texttt{conformal\_\allowbreak{}aware\_\allowbreak{}selective\_\allowbreak{}abstention\_\allowbreak{}clip\_\allowbreak{}colab\_\allowbreak{}persistent\_\allowbreak{}drive.\allowbreak{}ipynb}: A 59-cell Jupyter notebook (27 Markdown section headers and 32 code cells) structured for execution on Google Colab with Google Drive persistence.
+  \item \texttt{conformal\_\allowbreak{}aware\_\allowbreak{}selective\_\allowbreak{}abstention\_\allowbreak{}clip\_\allowbreak{}colab\_\allowbreak{}persistent\_\allowbreak{}drive.\allowbreak{}py}: A standalone Python script containing the exact code and section structure of the notebook, with IPython \texttt{\%pip} magic lines commented out for standard Python compatibility.
+  \item \texttt{code\_\allowbreak{}changes.\allowbreak{}py}: A standalone Python module recording all substantive cleanups, consolidations of duplicate function definitions, warning fixes, and retained implementation behaviors.
+  \item \texttt{README.\allowbreak{}md}: User-facing documentation covering setup, execution, and file conventions.
+  \item \texttt{report.\allowbreak{}tex} and \texttt{report.\allowbreak{}pdf}: This technical implementation report.
+\end{itemize}
+
+\subsection{External Software and Dataset Dependencies}
+
+Table~\ref{tab:dependencies} summarizes the Python libraries imported by the implementation and their specific roles in the pipeline.
+
+\begin{table}[!htbp]
+\centering
+\caption{Software libraries imported by the implementation and their functional roles.}
+\label{tab:dependencies}
+\begin{tabularx}{\textwidth}{L{0.16\textwidth} L{0.28\textwidth} Y}
+\toprule
+\textbf{Package} & \textbf{Import Symbol(s)} & \textbf{Implementation Role} \\
+\midrule
+Python stdlib & \texttt{os}, \texttt{sys}, \texttt{shutil}, \texttt{pathlib.\allowbreak{}Path}, \texttt{platform}, \texttt{datetime}, \texttt{warnings} & Filesystem management, atomic file replacement (\texttt{os.\allowbreak{}replace}), runtime environment inspection, UTC timestamps, and warning filters. \\
+Python stdlib & \texttt{json}, \texttt{hashlib}, \texttt{random} & Canonical JSON serialization, SHA-256 cache fingerprinting, and Python RNG seeding. \\
+Python stdlib & \texttt{urllib.\allowbreak{}request}, \texttt{tarfile}, \texttt{zipfile}, \texttt{math} & Downloading and validating \texttt{CIFAR-10-C.\allowbreak{}tar}, extracting \texttt{.\allowbreak{}npy} members, finite-sample conformal rank calculation (\texttt{math.\allowbreak{}ceil}), and packaging final ZIP archives. \\
+NumPy & \texttt{numpy as np} & Array storage, memory-mapped \texttt{.\allowbreak{}npy} reading, vectorized probability/uncertainty math, quantile estimation, trapezoidal integration (\texttt{np.\allowbreak{}trapezoid}), and multinomial/index bootstrap resampling. \\
+pandas & \texttt{pandas as pd} & Experiment matrix representation, summary and per-sample DataFrame assembly, grouped aggregations, CSV export, and Markdown table export (\texttt{to\_\allowbreak{}markdown}). \\
+SciPy & \texttt{scipy.\allowbreak{}optimize.\allowbreak{}minimize\_\allowbreak{}scalar}, \texttt{scipy.\allowbreak{}special.\allowbreak{}logsumexp} & Bounded scalar optimization for temperature scaling and numerically stable log-sum-exp normalization. \\
+scikit-learn & \texttt{roc\_\allowbreak{}auc\_\allowbreak{}score}, \texttt{average\_\allowbreak{}precision\_\allowbreak{}score} & Binary OOD detection evaluation (AUROC and AUPR-Out). \\
+PyTorch & \texttt{torch}, \texttt{Dataset}, \texttt{DataLoader} & Device management, RNG seeding, inference-mode execution, FP16 automatic mixed precision (\texttt{torch.\allowbreak{}autocast}), and batched image loading. \\
+torchvision & \texttt{torchvision}, \texttt{datasets} & Downloading and loading canonical CIFAR-10, CIFAR-100, and SVHN splits. \\
+OpenAI CLIP & \texttt{clip} & Loading frozen \texttt{ViT-B/\allowbreak{}32} model weights, image preprocessing transforms, BPE text tokenization (\texttt{clip.\allowbreak{}tokenize}), and image/text encoding. \\
+Pillow & \texttt{PIL.\allowbreak{}Image} & Converting raw \texttt{uint8} NumPy arrays into RGB \texttt{PIL.\allowbreak{}Image} instances for CLIP preprocessing. \\
+Matplotlib & \texttt{matplotlib.\allowbreak{}pyplot as plt} & Rendering risk-coverage curves, OOD comparisons, reliability diagrams, and heatmaps to PNG and PDF. \\
+tqdm & \texttt{tqdm.\allowbreak{}auto.\allowbreak{}tqdm} & Progress reporting for downloads, tar extraction, batch encoding, experiment loops, and bootstrap resampling. \\
+Colab API & \texttt{google.\allowbreak{}colab.\allowbreak{}drive}, \texttt{google.\allowbreak{}colab.\allowbreak{}files} & Conditional Google Drive mounting and browser download triggers when \texttt{IN\_\allowbreak{}COLAB} is \texttt{True}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Overall Implementation Workflow}
+
+The program is organized as a linear 26-stage pipeline in which each stage consumes validated in-memory objects or persistent disk caches produced by earlier stages:
+
+\begin{enumerate}
+  \item \textbf{Stage 1 -- Environment and Configuration (Sections 1--2)}: Initializes library imports, mounts Google Drive (when in Colab), defines the global \texttt{CONFIG} dictionary, prompt templates \texttt{PROMPTS}, corruption list \texttt{CORRUPTIONS}, severity list \texttt{SEVERITIES}, and the 10-row \texttt{EXPERIMENTS} DataFrame, creates output/cache subdirectories under \texttt{PERSISTENT\_\allowbreak{}PROJECT\_\allowbreak{}ROOT}, and seeds all RNGs with the first configured seed (\texttt{13}).
+  \item \textbf{Stage 2 -- Utility Registration (Section 3)}: Registers JSON canonicalization, SHA-256 fingerprinting, array finiteness and probability simplex validators, and atomic \texttt{.\allowbreak{}npz}/\texttt{.\allowbreak{}json} cache read/write helpers.
+  \item \textbf{Stage 3 -- Dataset Verification and Split Generation (Sections 4--5)}: Verifies or downloads CIFAR-10, CIFAR-100, SVHN, and CIFAR-10-C; checks array dimensions and label alignment; generates five deterministic 5,000-sample calibration index arrays (\texttt{CAL\_\allowbreak{}SPLITS}) from CIFAR-10 train; verifies disjointness against offset test indices (\texttt{TEST\_\allowbreak{}INDICES}); and writes \texttt{split\_\allowbreak{}metadata.\allowbreak{}json}.
+  \item \textbf{Stage 4 -- Frozen Model and Text/Image Feature Caching (Sections 6--10)}: Loads frozen CLIP \texttt{ViT-B/\allowbreak{}32}, precomputes L2-normalized text embeddings (\texttt{TEXT\_\allowbreak{}EMBEDDINGS}) for \texttt{P0}--\texttt{P3}, wraps datasets in \texttt{TorchvisionImageDataset} and \texttt{ArrayImageDataset}, and builds \texttt{CALIBRATION\_\allowbreak{}BANK} (50,000 CIFAR-10 train samples) and \texttt{DATA\_\allowbreak{}BANK} (21 held-out test/OOD datasets) containing validated per-prompt logits, labels, and image embeddings.
+  \item \textbf{Stage 5 -- Calibration Fitting and Calibration Feature Caching (Sections 11--17)}: Defines probability, entropy, margin, prompt-agreement, conformal-set, selective-prediction, OOD, calibration, and bootstrap functions. Fits scalar temperature $T$ and conformal quantile $\hat{q}_{1-\alpha}$ per seed on \texttt{CALIBRATION\_\allowbreak{}BANK} (\texttt{SEED\_\allowbreak{}CALIBRATIONS}), saves \texttt{seed\_\allowbreak{}calibration\_\allowbreak{}parameters.\allowbreak{}json}, and caches per-seed calibration confidence and correctness arrays (\texttt{CAL\_\allowbreak{}FEATURES}) for all six methods.
+  \item \textbf{Stage 6 -- Full Experiment Matrix Execution and Statistical Summaries (Sections 18--23)}: Expands \texttt{EXPERIMENTS} into the 30-row \texttt{FULL\_\allowbreak{}MATRIX}, evaluates all 30 conditions across 5 seeds and 6 methods to produce \texttt{summary\_\allowbreak{}df} (\texttt{all\_\allowbreak{}results.\allowbreak{}csv}) and \texttt{sample\_\allowbreak{}df} (\texttt{per\_\allowbreak{}sample\_\allowbreak{}records.\allowbreak{}csv}), aggregates fixed-coverage, risk-constrained, calibration, OOD, and curve summary tables, runs 2,000-resample bootstrap confidence intervals (\texttt{bootstrap\_\allowbreak{}95ci.\allowbreak{}csv}), generates 13 figure stems (PNG and PDF), and extracts top-25 diagnostic failure cases per category (\texttt{failure\_\allowbreak{}cases.\allowbreak{}csv}).
+  \item \textbf{Stage 7 -- Provenance, Audit, and Packaging (Sections 24--26)}: Writes \texttt{experiment\_\allowbreak{}metadata.\allowbreak{}json}, executes the 34-check \texttt{final\_\allowbreak{}validation(\allowbreak{})} audit (\texttt{final\_\allowbreak{}validation\_\allowbreak{}checklist.\allowbreak{}csv}), copies all deliverables into \texttt{final\_\allowbreak{}output/\allowbreak{}}, writes \texttt{completion\_\allowbreak{}summary.\allowbreak{}json}, and builds downloadable ZIP archives.
+\end{enumerate}
+
+\section{Input Data and Preparation}
+
+\subsection{Dataset Specifications and Storage Layout}
+
+Table~\ref{tab:datasets} details the datasets used by the pipeline, their split sizes, image dimensions, label conventions, and roles.
+
+\begin{table}[!htbp]
+\centering
+\caption{Datasets used in the implementation, their shapes, and their experimental roles.}
+\label{tab:datasets}
+\begin{tabularx}{\textwidth}{L{0.12\textwidth} L{0.07\textwidth} r L{0.28\textwidth} Y}
+\toprule
+\textbf{Dataset} & \textbf{Split} & \textbf{Samples} & \textbf{Raw Format / Shape} & \textbf{Pipeline Role} \\
+\midrule
+CIFAR-10 & Train & $50,000$ & Python batch files; $(50000, 32, 32, 3)$ \texttt{uint8}, labels in $\{0,\dots,9\}$ & Source pool for the five seeded 5,000-sample calibration subsets (\texttt{CAL\_\allowbreak{}SPLITS}). \\
+CIFAR-10 & Test & $10,000$ & Python batch file; $(10000, 32, 32, 3)$ \texttt{uint8}, labels in $\{0,\dots,9\}$ & Clean ID evaluation (\texttt{E1}), prompt-shift ID evaluation (\texttt{E2}), and ID reference for OOD detection (\texttt{E7}--\texttt{E10}). \\
+CIFAR-10-C & Test & $10,000$ per slice & Memory-mapped \texttt{<corruption>.\allowbreak{}npy} of shape $(50000, 32, 32, 3)$ \texttt{uint8} and \texttt{labels.\allowbreak{}npy} of shape $(50000,)$ & Visual shift evaluation at severities 1 (\texttt{E3}), 3 (\texttt{E4}, \texttt{E6}), and 5 (\texttt{E5}) across 6 corruptions (18 slices total). \\
+CIFAR-100 & Test & $10,000$ & Python batch file; $(10000, 32, 32, 3)$ \texttt{uint8}, 100 fine classes & Semantic OOD evaluation under prompt \texttt{P0} (\texttt{E7}) and prompt \texttt{P1} (\texttt{E9}). \\
+SVHN & Test & $26,032$ & MATLAB \texttt{svhn\_\allowbreak{}test.\allowbreak{}mat}; $32 \times 32$ RGB digit crops, labels in $\{1,\dots,10\}$ & Far-OOD evaluation under prompt \texttt{P0} (\texttt{E8}) and prompt \texttt{P1} (\texttt{E10}). \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Verification, Slicing, and Preprocessing}
+
+Before loading datasets, \texttt{\_\allowbreak{}dataset\_\allowbreak{}present(\allowbreak{}root,\allowbreak{} required\_\allowbreak{}paths)} checks whether the underlying extracted files (\texttt{data\_\allowbreak{}batch\_\allowbreak{}1}--\texttt{5} and \texttt{test\_\allowbreak{}batch} for CIFAR-10, \texttt{test} for CIFAR-100, and \texttt{svhn\_\allowbreak{}test.\allowbreak{}mat} for SVHN) already exist on persistent storage, setting \texttt{download=False} when present and \texttt{download=True} otherwise. After loading CIFAR-10, Cell 10 asserts that \texttt{cifar10\_\allowbreak{}train\_\allowbreak{}raw.\allowbreak{}classes} and \texttt{cifar10\_\allowbreak{}test\_\allowbreak{}raw.\allowbreak{}classes} match the canonical 10-element list:
+\begin{lstlisting}[language=Python]
+CIFAR10_CLASSES = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog", "frog", "horse", "ship", "truck"
+]
+\end{lstlisting}
+
+For CIFAR-10-C, \texttt{extract\_\allowbreak{}cifar10c\_\allowbreak{}tar(\allowbreak{})} checks for the six required \texttt{<corruption>.\allowbreak{}npy} files (\texttt{gaussian\_\allowbreak{}noise}, \texttt{motion\_\allowbreak{}blur}, \texttt{fog}, \texttt{brightness}, \texttt{contrast}, \texttt{jpeg\_\allowbreak{}compression}) and \texttt{labels.\allowbreak{}npy}. If any file is missing, it validates or downloads \texttt{CIFAR-10-C.\allowbreak{}tar} via \texttt{download\_\allowbreak{}with\_\allowbreak{}progress} (writing to a temporary \texttt{.\allowbreak{}part} file and atomically renaming upon completion) and extracts only the seven required files. Cell 12 then opens each \texttt{.\allowbreak{}npy} file in read-only memory-mapped mode (\texttt{mmap\_\allowbreak{}mode="r"}), asserts shape $(50000, 32, 32, 3)$, and verifies that for every severity $s \in \{1, 3, 5\}$, the 10,000-element label slice \texttt{labels\_\allowbreak{}c[(\allowbreak{}s - 1) * 10000 : s * 10000]} is elementwise identical to \texttt{cifar10\_\allowbreak{}test\_\allowbreak{}raw.\allowbreak{}targets}.
+
+Image preprocessing is handled by two \texttt{torch.\allowbreak{}utils.\allowbreak{}data.\allowbreak{}Dataset} subclasses in Section 8:
+\begin{itemize}
+  \item \texttt{ArrayImageDataset(\allowbreak{}images,\allowbreak{} labels,\allowbreak{} indices=None)}: Indexes into a memory-mapped CIFAR-10-C slice, casts the $(32, 32, 3)$ array to \texttt{uint8}, constructs a \texttt{PIL.\allowbreak{}Image.\allowbreak{}fromarray(\allowbreak{}.\allowbreak{}.\allowbreak{}.\allowbreak{},\allowbreak{} mode="RGB")}, applies the OpenAI CLIP \texttt{preprocess} pipeline (bicubic resize/center-crop to $224 \times 224$, RGB tensor conversion, and channel-wise CLIP mean/std normalization), and returns the 3-tuple \texttt{(\allowbreak{}tensor,\allowbreak{} int(\allowbreak{}label),\allowbreak{} int(\allowbreak{}idx))}.
+  \item \texttt{TorchvisionImageDataset(\allowbreak{}base\_\allowbreak{}dataset,\allowbreak{} label\_\allowbreak{}transform=None)}: Wraps a \texttt{torchvision} dataset, converts non-PIL images to \texttt{uint8} RGB \texttt{PIL.\allowbreak{}Image} objects if needed, applies CLIP \texttt{preprocess}, and applies \texttt{label\_\allowbreak{}transform(\allowbreak{}y)}. For SVHN, \texttt{svhn\_\allowbreak{}dataset(\allowbreak{})} supplies \texttt{label\_\allowbreak{}transform=lambda x: 0 if int(\allowbreak{}x) == 10 else int(\allowbreak{}x)} to map SVHN's label \texttt{10} (digit zero) to \texttt{0} for metadata consistency (note that OOD evaluation ignores ground-truth class labels and sets \texttt{correctness = np.\allowbreak{}nan}).
+\end{itemize}
+
+\section{Main Components}
+
+Table~\ref{tab:components} provides a structured inventory of the classes and functions implemented across the notebook and script, detailing their inputs, return values, and responsibilities.
+
+\subsection{Utility, Split, and Prompt Components (Sections 2--7)}
+
+\begin{itemize}
+  \item \texttt{set\_\allowbreak{}global\_\allowbreak{}seed(\allowbreak{}seed: int) -> None} and \texttt{seed\_\allowbreak{}numpy(\allowbreak{}seed: int) -> np.\allowbreak{}random.\allowbreak{}Generator}: \texttt{set\_\allowbreak{}global\_\allowbreak{}seed} seeds \texttt{random}, \texttt{np.\allowbreak{}random}, and \texttt{torch} (CPU and all CUDA devices), sets \texttt{cudnn.\allowbreak{}deterministic = True} and \texttt{cudnn.\allowbreak{}benchmark = False}, and calls \texttt{torch.\allowbreak{}use\_\allowbreak{}deterministic\_\allowbreak{}algorithms(\allowbreak{}True,\allowbreak{} warn\_\allowbreak{}only=True)}. \texttt{seed\_\allowbreak{}numpy} returns an isolated \texttt{np.\allowbreak{}random.\allowbreak{}default\_\allowbreak{}rng(\allowbreak{}seed)} instance so calibration split generation does not depend on global RNG state.
+  \item \texttt{canonical\_\allowbreak{}json(\allowbreak{}obj) -> str}, \texttt{sha256\_\allowbreak{}text(\allowbreak{}text: str) -> str}, and \texttt{config\_\allowbreak{}fingerprint(\allowbreak{}extra: dict) -> str}: Serialize nested dictionaries with sorted keys and compact separators (\texttt{(\allowbreak{}",",\allowbreak{} ":")}), hash the resulting UTF-8 string with SHA-256, and slice the first 16 hex characters to version cache files.
+  \item \texttt{save\_\allowbreak{}array\_\allowbreak{}cache(\allowbreak{}path: Path,\allowbreak{} arrays: dict,\allowbreak{} metadata: dict) -> None} and \texttt{load\_\allowbreak{}array\_\allowbreak{}cache(\allowbreak{}path: Path,\allowbreak{} expected\_\allowbreak{}fingerprint: str)}: \texttt{save\_\allowbreak{}array\_\allowbreak{}cache} writes \texttt{arrays} to a temporary \texttt{.\allowbreak{}tmp.\allowbreak{}npz} file, atomically moves it to \texttt{path} via \texttt{os.\allowbreak{}replace}, and writes \texttt{metadata} to \texttt{<path>.\allowbreak{}json}. \texttt{load\_\allowbreak{}array\_\allowbreak{}cache} reads \texttt{<path>.\allowbreak{}json}, verifies \texttt{metadata.\allowbreak{}get(\allowbreak{}"fingerprint") == expected\_\allowbreak{}fingerprint}, and loads the \texttt{.\allowbreak{}npz} archive with \texttt{allow\_\allowbreak{}pickle=False}. If the file is missing, corrupt, or has a mismatched fingerprint, it returns \texttt{None}.
+  \item \texttt{make\_\allowbreak{}calibration\_\allowbreak{}split(\allowbreak{}seed: int,\allowbreak{} n\_\allowbreak{}total: int = 50000,\allowbreak{} n\_\allowbreak{}cal: int = 5000) -> np.\allowbreak{}ndarray}: Validates $n_{\text{total}} > 1$ and $0 < n_{\text{cal}} < n_{\text{total}}$, samples $n_{\text{cal}}$ unique indices from $[0, n_{\text{total}})$ using \texttt{seed\_\allowbreak{}numpy(\allowbreak{}seed).\allowbreak{}choice(\allowbreak{}.\allowbreak{}.\allowbreak{}.\allowbreak{},\allowbreak{} replace=False)}, sorts them in ascending order as \texttt{int64}, and asserts 1-D shape, exact length, uniqueness, and bounds.
+  \item \texttt{build\_\allowbreak{}prompts(\allowbreak{}class\_\allowbreak{}names,\allowbreak{} prompt\_\allowbreak{}key)} and \texttt{get\_\allowbreak{}text\_\allowbreak{}embeddings(\allowbreak{}prompt\_\allowbreak{}key)}: Format each class name into the template \texttt{PROMPTS[prompt\_\allowbreak{}key]} (e.g., \texttt{"a photo of a airplane.\allowbreak{}"}), tokenize the 10 strings via \texttt{clip.\allowbreak{}tokenize}, encode them with \texttt{model.\allowbreak{}encode\_\allowbreak{}text(\allowbreak{}tokens)}, normalize each row by its L2 norm clamped at $10^{-12}$, cache the $(10, 512)$ \texttt{float32} array, and return it.
+\end{itemize}
+
+\subsection{Inference, Calibration, and Metric Components (Sections 9--16)}
+
+\begin{itemize}
+  \item \texttt{encode\_\allowbreak{}image\_\allowbreak{}dataset(\allowbreak{}dataset,\allowbreak{} cache\_\allowbreak{}name,\allowbreak{} expected\_\allowbreak{}extra) -> tuple[np.\allowbreak{}ndarray,\allowbreak{} np.\allowbreak{}ndarray]}: Checks for a valid cached image-embedding archive; on a cache miss, iterates over a non-shuffled \texttt{DataLoader} of size \texttt{CONFIG["batch\_\allowbreak{}size"]}, runs \texttt{model.\allowbreak{}encode\_\allowbreak{}image(\allowbreak{}images)} (inside \texttt{torch.\allowbreak{}autocast(\allowbreak{}"cuda",\allowbreak{} dtype=torch.\allowbreak{}float16)} when \texttt{CONFIG["use\_\allowbreak{}amp"]} is true), normalizes embeddings to unit L2 norm, concatenates batches into $(N, 512)$ \texttt{float32} embeddings and $(N,)$ \texttt{int64} labels, caches them, and returns \texttt{(\allowbreak{}emb,\allowbreak{} y)}.
+  \item \texttt{compute\_\allowbreak{}prompt\_\allowbreak{}logits(\allowbreak{}image\_\allowbreak{}embeddings,\allowbreak{} prompt\_\allowbreak{}embeddings) -> dict[str,\allowbreak{} np.\allowbreak{}ndarray]}: Retrieves the scalar logit scale $s = \exp(\texttt{model.\allowbreak{}logit\_\allowbreak{}scale})$ and computes $Z^{(p)} = s \cdot E_{\text{img}} (E_{\text{txt}}^{(p)})^\top \in \mathbb{R}^{N \times 10}$ for each prompt $p \in \{\texttt{P0}, \texttt{P1}, \texttt{P2}, \texttt{P3}\}$.
+  \item \texttt{\_\allowbreak{}validate\_\allowbreak{}prompt\_\allowbreak{}logits\_\allowbreak{}bank} and \texttt{get\_\allowbreak{}condition\_\allowbreak{}logits}: Verify that all four prompts exist in the logits dictionary, shapes equal $(N, 10)$, label length equals embedding length $N$, and all arrays are finite. Cache logits under keys \texttt{logits\_\allowbreak{}P0}--\texttt{logits\_\allowbreak{}P3}.
+  \item \texttt{evaluate\_\allowbreak{}seed\_\allowbreak{}condition(\allowbreak{}seed,\allowbreak{} condition\_\allowbreak{}id,\allowbreak{} logits\_\allowbreak{}by\_\allowbreak{}prompt,\allowbreak{} labels,\allowbreak{} primary\_\allowbreak{}prompt,\allowbreak{} is\_\allowbreak{}ood)}: Computes all six methods' predictions, confidences, uncertainties, and conformal set sizes for one condition and seed. For in-distribution conditions (\texttt{not is\_\allowbreak{}ood}), evaluates fixed-coverage operating points ($\{0.50, 0.70, 0.80, 0.90\}$), risk-constrained operating points ($\{0.05, 0.10\}$), curve summaries (full-coverage risk, AURC, EAURC), and calibration metrics (ECE, NLL, Brier). Returns \texttt{(\allowbreak{}summary\_\allowbreak{}rows\_\allowbreak{}df,\allowbreak{} per\_\allowbreak{}method\_\allowbreak{}dict,\allowbreak{} extras\_\allowbreak{}dict)}.
+\end{itemize}
+
+\section{Model and Algorithm Implementation}
+
+\subsection{Zero-Shot CLIP Similarity and Base Probabilities}
+
+For an input image $x_i$, let $z_{\text{img}}(x_i) \in \mathbb{R}^D$ ($D = 512$ for \texttt{ViT-B/\allowbreak{}32}) denote the raw visual feature vector produced by \texttt{model.\allowbreak{}encode\_\allowbreak{}image}, and for class $c \in \{0, \dots, K-1\}$ ($K = 10$) under prompt template $p \in \{\texttt{P0}, \texttt{P1}, \texttt{P2}, \texttt{P3}\}$, let $z_{\text{txt}}^{(p)}(c) \in \mathbb{R}^D$ denote the raw text feature vector produced by \texttt{model.\allowbreak{}encode\_\allowbreak{}text}. Both vectors are L2-normalized with a lower norm clamp of $\varepsilon = 10^{-12}$:
+\begin{equation}
+  \hat{u}_i = \frac{z_{\text{img}}(x_i)}{\max\!\left(\|z_{\text{img}}(x_i)\|_2, \, 10^{-12}\right)}, \qquad
+  \hat{v}_c^{(p)} = \frac{z_{\text{txt}}^{(p)}(c)}{\max\!\left(\|z_{\text{txt}}^{(p)}(c)\|_2, \, 10^{-12}\right)}.
+\end{equation}
+With learned scalar logit scale $s = \exp(\texttt{model.\allowbreak{}logit\_\allowbreak{}scale})$, the zero-shot logit for sample $i$ and class $c$ under prompt $p$ is:
+\begin{equation}
+  \ell_{i,c}^{(p)} = s \, \langle \hat{u}_i, \, \hat{v}_c^{(p)} \rangle.
+\end{equation}
+In \texttt{softmax\_\allowbreak{}np(\allowbreak{}logits)}, logits are cast to \texttt{float64}, shifted by $\operatorname{logsumexp}(\ell_i^{(p)})$ for numerical stability, exponentiated, and normalized to form the probability vector $p_i^{(p)} \in \Delta^{K-1}$:
+\begin{equation}
+  p_{i,c}^{(p)} = \frac{\exp\!\left(\ell_{i,c}^{(p)} - \log \sum_{k=0}^{K-1} \exp(\ell_{i,k}^{(p)})\right)}{\sum_{j=0}^{K-1} \exp\!\left(\ell_{i,j}^{(p)} - \log \sum_{k=0}^{K-1} \exp(\ell_{i,k}^{(p)})\right)}.
+\end{equation}
+
+\subsection{Base Confidence and Uncertainty Scores (\texttt{MSP}, \texttt{entropy}, \texttt{margin})}
+
+Given a primary prompt $p \in \{\texttt{P0}, \texttt{P1}\}$ for an experimental condition, let $p_i = p_i^{(p)}$ denote the base probability vector and let $p_{i,(1)} \ge p_{i,(2)} \ge \dots \ge p_{i,(K)}$ denote its sorted components in descending order (\texttt{top12\_\allowbreak{}stats}). The predicted class is $\hat{y}_i = \arg\max_{c} p_{i,c}$. The three base scoring methods are defined as follows:
+\begin{itemize}
+  \item \textbf{MSP}:
+  \begin{equation}
+    \text{conf}_{\text{MSP}}(x_i) = p_{i,(1)}, \qquad \text{unc}_{\text{MSP}}(x_i) = 1 - p_{i,(1)}.
+  \end{equation}
+  \item \textbf{Normalized Entropy} (with probability clipping $\tilde{p}_{i,c} = \min(\max(p_{i,c}, 10^{-12}), 1.0)$ in \texttt{entropy\_\allowbreak{}np}):
+  \begin{equation}
+  \begin{aligned}
+    H_{\text{norm}}(p_i) &= -\frac{1}{\ln K} \sum_{c=0}^{K-1} \tilde{p}_{i,c} \ln \tilde{p}_{i,c}, \\
+    \text{conf}_{\text{ent}}(x_i) &= 1 - H_{\text{norm}}(p_i), \qquad
+    \text{unc}_{\text{ent}}(x_i) = H_{\text{norm}}(p_i).
+  \end{aligned}
+  \end{equation}
+  \item \textbf{Margin}:
+  \begin{equation}
+    \text{conf}_{\text{margin}}(x_i) = p_{i,(1)} - p_{i,(2)}, \qquad
+    \text{unc}_{\text{margin}}(x_i) = 1 - \left(p_{i,(1)} - p_{i,(2)}\right).
+  \end{equation}
+\end{itemize}
+
+\subsection{Post-Hoc Temperature Scaling (\texttt{temperature\_\allowbreak{}MSP})}
+
+For each seed $s$ and its calibration index set $\mathcal{I}_{\text{cal}}^{(s)} \subset \{0, \dots, 49999\}$ of size $n = 5000$, \texttt{fit\_\allowbreak{}temperature} finds a scalar temperature $T^{(s)} \in [0.05, 10.0]$ minimizing the empirical multiclass negative log-likelihood on the calibration prompt $\texttt{P0}$:
+\begin{equation}
+  T^{(s)} = \arg\min_{T \in [0.05, 10.0]} \frac{1}{n} \sum_{i \in \mathcal{I}_{\text{cal}}^{(s)}} \!\left( \log \sum_{c=0}^{K-1} \exp\!\left(\frac{\ell_{i,c}^{(\texttt{P0})}}{T}\right) - \frac{\ell_{i,y_i}^{(\texttt{P0})}}{T} \right),
+\end{equation}
+using Brent's bounded scalar minimization (\texttt{scipy.\allowbreak{}optimize.\allowbreak{}minimize\_scalar(.\allowbreak{}.\allowbreak{}.\allowbreak{}, method="bounded", options=\{"xatol": 1e-4, "maxiter": 200\})}). At evaluation time on primary prompt $p$, \texttt{temperature\_\allowbreak{}scale\_\allowbreak{}logits} computes $\tilde{\ell}_i^{(p)} = \ell_i^{(p)} / T^{(s)}$, and \texttt{temperature\_\allowbreak{}MSP} uses the resulting top-1 softmax probability $\tilde{p}_{i,(1)}^{(p)}$ as confidence and $1 - \tilde{p}_{i,(1)}^{(p)}$ as uncertainty. Because $T^{(s)} > 0$, temperature scaling preserves the top-1 argmax class prediction.
+
+\subsection{Multi-Prompt Agreement and Instability (\texttt{prompt\_\allowbreak{}agreement})}
+
+Let $\mathcal{P} = \{\texttt{P0}, \texttt{P1}, \texttt{P2}, \texttt{P3}\}$ denote the four prompt templates ($M = |\mathcal{P}| = 4$). For each prompt $p \in \mathcal{P}$, the predicted class for sample $i$ is $\hat{y}_i^{(p)} = \arg\max_{c} \ell_{i,c}^{(p)}$. In \texttt{prompt\_\allowbreak{}level\_\allowbreak{}outputs}, class vote counts are accumulated across the $M$ prompts:
+\begin{equation}
+  v_{i,c} = \sum_{p \in \mathcal{P}} \mathbb{I}\!\left(\hat{y}_i^{(p)} = c\right), \qquad c \in \{0, \dots, K-1\}.
+\end{equation}
+The majority-vote prediction, prompt agreement confidence, and prompt instability uncertainty are defined as:
+\begin{equation}
+\begin{aligned}
+  \hat{y}_i^{\text{maj}} &= \arg\max_{c \in \{0,\dots,K-1\}} v_{i,c}, \\
+  \text{conf}_{\text{PA}}(x_i) &= \frac{v_{i, \hat{y}_i^{\text{maj}}}}{M} \in \{0.25, 0.50, 0.75, 1.00\}, \qquad
+  \text{unc}_{\text{PA}}(x_i) = 1 - \text{conf}_{\text{PA}}(x_i),
+\end{aligned}
+\end{equation}
+where ties in $\arg\max_{c} v_{i,c}$ are broken by the lowest class index $c$ (\texttt{np.\allowbreak{}argmax} convention).
+
+\subsection{Split-Conformal Prediction Sets (\texttt{conformal\_\allowbreak{}set\_\allowbreak{}size})}
+
+For each calibration sample $i \in \mathcal{I}_{\text{cal}}^{(s)}$ with true label $y_i$ and unscaled \texttt{P0} softmax probability vector $p_i^{(\texttt{P0})}$, \texttt{fit\_\allowbreak{}seed\_\allowbreak{}calibration} defines the nonconformity score:
+\begin{equation}
+  s_i = 1 - p_{i, y_i}^{(\texttt{P0})} \in [0, 1].
+\end{equation}
+Given target miscoverage $\alpha = 0.10$ and calibration size $n = 5000$, the finite-sample corrected order-statistic rank and quantile level are:
+\begin{equation}
+  r = \lceil (n + 1)(1 - \alpha) \rceil = \lceil 5001 \times 0.90 \rceil = 4501, \qquad
+  q_{\text{level}} = \min\!\left(1.0, \, \frac{r}{n}\right) = \frac{4501}{5000} = 0.9002,
+\end{equation}
+and $\hat{q}_{1-\alpha}^{(s)}$ is computed as \texttt{np.\allowbreak{}quantile(\allowbreak{}conformal\_\allowbreak{}nonconf,\allowbreak{} quantile\_\allowbreak{}level,\allowbreak{} method="higher")}, which selects the $r$-th smallest nonconformity score $s_{(r)}$.
+
+At evaluation time on primary prompt $p$ with unscaled probability vector $p_i^{(p)}$, \texttt{conformal\_\allowbreak{}sets} constructs the prediction set:
+\begin{equation}
+  C(x_i) = \left\{ c \in \{0, \dots, K-1\} : p_{i,c}^{(p)} \ge (1 - \hat{q}_{1-\alpha}^{(s)}) - 10^{-12} \right\}.
+\end{equation}
+If $C(x_i)$ is empty for any sample, the top-1 class $\arg\max_{c} p_{i,c}^{(p)}$ is inserted so that $|C(x_i)| \ge 1$ holds everywhere. The \texttt{conformal\_\allowbreak{}set\_\allowbreak{}size} method uses the base argmax prediction $\hat{y}_i = \arg\max_c p_{i,c}^{(p)}$ as its point prediction and defines:
+\begin{equation}
+  \text{conf}_{\text{conf}}(x_i) = \frac{1}{\max(|C(x_i)|, 1)}, \qquad
+  \text{unc}_{\text{conf}}(x_i) = |C(x_i)| \in \{1, \dots, 10\}.
+\end{equation}
+
+\section{Calibration and Inference Processing Procedure}
+
+\subsection{Two-Stage Caching Architecture}
+
+Because encoding images through CLIP \texttt{ViT-B/\allowbreak{}32} across 22 dataset splits (50,000 train images + 10,000 CIFAR-10 test + 10,000 CIFAR-100 test + 26,032 SVHN test + $18 \times 10,000$ CIFAR-10-C images = $276,032$ total images) is the primary computational bottleneck, the pipeline decouples feature extraction into three cached stages:
+\begin{enumerate}
+  \item \textbf{Text Embedding Cache (\texttt{cache/\allowbreak{}text\_\allowbreak{}embeddings/\allowbreak{}})}: Encodes the 10 class prompts for each template \texttt{P0}--\texttt{P3} once and saves $(10, 512)$ normalized embeddings.
+  \item \textbf{Image Embedding Cache (\texttt{cache/\allowbreak{}image\_\allowbreak{}embeddings/\allowbreak{}})}: Encodes each dataset split once (independent of prompt templates) and saves $(N, 512)$ normalized image embeddings and $(N,)$ labels.
+  \item \textbf{Logit Bank Cache (\texttt{cache/\allowbreak{}logits/\allowbreak{}})}: Multiplies cached image embeddings by all four cached text embedding matrices, scales by $\exp(\texttt{model.\allowbreak{}logit\_\allowbreak{}scale})$, validates shapes and finiteness via \texttt{\_\allowbreak{}validate\_\allowbreak{}prompt\_\allowbreak{}logits\_\allowbreak{}bank}, and stores \texttt{logits\_\allowbreak{}P0}--\texttt{logits\_\allowbreak{}P3}.
+\end{enumerate}
+
+\subsection{Per-Seed Calibration and Evaluation Workflow}
+
+Once \texttt{CALIBRATION\_\allowbreak{}BANK} and \texttt{DATA\_\allowbreak{}BANK} are populated in Section 10:
+\begin{enumerate}
+  \item Section 12 iterates over \texttt{seed} in \texttt{[13,\allowbreak{} 42,\allowbreak{} 123,\allowbreak{} 456,\allowbreak{} 765]}, slices \texttt{CALIBRATION\_\allowbreak{}BANK} using \texttt{CAL\_\allowbreak{}SPLITS[seed]}, fits $T^{(s)}$ and $\hat{q}_{1-\alpha}^{(s)}$, and stores the resulting dictionary in \texttt{SEED\_\allowbreak{}CALIBRATIONS[seed]}.
+  \item Section 17 iterates over \texttt{SEED\_\allowbreak{}CALIBRATIONS}, evaluates all six uncertainty methods on the 5,000 calibration samples for each seed, and stores the calibration confidence vectors (\texttt{CAL\_\allowbreak{}FEATURES[seed]["conf"][method]}) and boolean correctness vectors (\texttt{CAL\_\allowbreak{}FEATURES[seed]["correct"][method]}).
+  \item Section 18 precomputes clean CIFAR-10 (\texttt{E1}) ID uncertainty arrays per seed and prompt in \texttt{id\_\allowbreak{}seed\_\allowbreak{}cache}, then iterates over the 30 rows of \texttt{FULL\_\allowbreak{}MATRIX} and the 5 seeds. For each \texttt{(\allowbreak{}row,\allowbreak{} seed)} pair:
+  \begin{itemize}
+    \item \texttt{evaluate\_\allowbreak{}seed\_\allowbreak{}condition} computes test-set predictions, confidences, and uncertainties for all 6 methods.
+    \item For ID conditions (\texttt{E1}--\texttt{E6}), \texttt{evaluate\_\allowbreak{}seed\_\allowbreak{}condition} selects thresholds from \texttt{CAL\_\allowbreak{}FEATURES[seed]} for the 4 fixed coverage targets and 2 risk targets, evaluates test-set selective metrics, computes AURC/EAURC, and computes ECE/NLL/Brier.
+    \item For OOD conditions (\texttt{E7}--\texttt{E10}), the outer loop pairs the OOD uncertainty scores with the corresponding clean CIFAR-10 ID uncertainty scores from \texttt{id\_\allowbreak{}seed\_\allowbreak{}cache[seed][prompt\_\allowbreak{}condition]} and calls \texttt{ood\_\allowbreak{}metrics(\allowbreak{}id\_\allowbreak{}u,\allowbreak{} ood\_\allowbreak{}u)}.
+    \item Six per-sample DataFrames (one per method, each of length $N$) are concatenated and appended to \texttt{all\_\allowbreak{}sample\_\allowbreak{}records}.
+  \end{itemize}
+\end{enumerate}
+
+\section{Configuration and Parameter Handling}
+
+Table~\ref{tab:config} documents all keys in the central \texttt{CONFIG} dictionary (defined in Cell 05 and updated in Cell 25), their values, and their effects on execution.
+
+\begin{table}[!htbp]
+\centering
+\caption{Configuration parameters in \texttt{CONFIG}, their types, values, and effects.}
+\label{tab:config}
+\begin{tabularx}{\textwidth}{L{0.23\textwidth} L{0.11\textwidth} L{0.24\textwidth} Y}
+\toprule
+\textbf{Key} & \textbf{Type} & \textbf{Configured Value} & \textbf{Effect in Pipeline} \\
+\midrule
+\texttt{model\_\allowbreak{}name} & \texttt{str} & \texttt{"ViT-B/\allowbreak{}32"} & Architecture name passed to \texttt{clip.\allowbreak{}load}. \\
+\texttt{model\_\allowbreak{}identifier} & \texttt{str} & \texttt{"openai-clip/\allowbreak{}ViT-B/\allowbreak{}32"} & Identifier included in \texttt{config\_\allowbreak{}fingerprint} and metadata. \\
+\texttt{seeds} & \texttt{list[int]} & \texttt{[13,\allowbreak{} 42,\allowbreak{} 123,\allowbreak{} 456,\allowbreak{} 765]} & Seeds controlling calibration split sampling and bootstrap RNG offsets. \\
+\texttt{calibration\_\allowbreak{}size} & \texttt{int} & \texttt{5000} & Number of CIFAR-10 train samples per seed calibration subset. \\
+\texttt{batch\_\allowbreak{}size} & \texttt{int} & \texttt{128} (CUDA) / \texttt{32} (CPU) & Mini-batch size for \texttt{DataLoader} during CLIP image encoding. \\
+\texttt{num\_\allowbreak{}workers} & \texttt{int} & \texttt{min(\allowbreak{}4,\allowbreak{} cpu\_\allowbreak{}count)} $\to$ \texttt{0} & Set in Cell 05, then overridden to \texttt{0} in Cell 25 for Colab stability. \\
+\texttt{pin\_\allowbreak{}memory} & \texttt{bool} & \texttt{torch.\allowbreak{}cuda.\allowbreak{}is\_\allowbreak{}available(\allowbreak{})} & Enables pinned host memory in \texttt{DataLoader} when on CUDA. \\
+\texttt{use\_\allowbreak{}amp} & \texttt{bool} & \texttt{torch.\allowbreak{}cuda.\allowbreak{}is\_\allowbreak{}available(\allowbreak{})} & Enables FP16 \texttt{torch.\allowbreak{}autocast} during \texttt{model.\allowbreak{}encode\_\allowbreak{}image} on CUDA. \\
+\texttt{temperature\_\allowbreak{}bounds} & \texttt{tuple} & \texttt{(\allowbreak{}0.\allowbreak{}05,\allowbreak{} 10.\allowbreak{}0)} & Lower and upper bounds for scalar temperature optimization in \texttt{fit\_\allowbreak{}temperature}. \\
+\texttt{conformal\_\allowbreak{}alpha} & \texttt{float} & \texttt{0.\allowbreak{}10} & Target miscoverage level $\alpha$ for split-conformal calibration ($1 - \alpha = 0.90$). \\
+\texttt{coverage\_\allowbreak{}targets} & \texttt{list[float]} & \texttt{[0.\allowbreak{}50,\allowbreak{} 0.\allowbreak{}70,\allowbreak{} 0.\allowbreak{}80,\allowbreak{} 0.\allowbreak{}90]} & Nominal coverage levels for fixed-coverage selective prediction. \\
+\texttt{risk\_\allowbreak{}targets} & \texttt{list[float]} & \texttt{[0.\allowbreak{}05,\allowbreak{} 0.\allowbreak{}10]} & Maximum calibration selective risk bounds for risk-constrained coverage. \\
+\texttt{bootstrap\_\allowbreak{}resamples} & \texttt{int} & \texttt{2000} & Number of bootstrap replicates per confidence interval (enforced equal to 2,000). \\
+\texttt{bootstrap\_\allowbreak{}seed} & \texttt{int} & \texttt{20260915} & Base seed offset added to \texttt{seed} (plus \texttt{0}, \texttt{17}, or \texttt{101}) in bootstrap functions. \\
+\texttt{ece\_\allowbreak{}bins} & \texttt{int} & \texttt{15} & Number of equal-width bins in $[0, 1]$ for ECE and reliability diagrams. \\
+\texttt{cache\_\allowbreak{}enabled} & \texttt{bool} & \texttt{True} & Controls whether image embeddings and logits are read from and saved to disk. \\
+\texttt{cache\_\allowbreak{}version} & \texttt{str} & \texttt{"v2\_\allowbreak{}persistent\_\allowbreak{}drive"} & Version tag included in \texttt{config\_\allowbreak{}fingerprint} to invalidate incompatible caches. \\
+\texttt{calibration\_\allowbreak{}prompt} & \texttt{str} & \texttt{"P0"} & Prompt template used for fitting temperature $T^{(s)}$, $\hat{q}_{1-\alpha}^{(s)}$, and \texttt{CAL\_\allowbreak{}FEATURES}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Table~\ref{tab:experiments} lists the 10 experiment families (\texttt{E1}--\texttt{E10}) defined in \texttt{EXPERIMENTS} and expanded by \texttt{expanded\_\allowbreak{}experiment\_\allowbreak{}matrix(\allowbreak{})} into the 30 rows of \texttt{FULL\_\allowbreak{}MATRIX}.
+
+\begin{table}[!htbp]
+\centering
+\caption{Experiment families \texttt{E1}--\texttt{E10} and their expansion in \texttt{FULL\_\allowbreak{}MATRIX}.}
+\label{tab:experiments}
+\setlength{\tabcolsep}{3.5pt}\footnotesize\begin{tabularx}{\textwidth}{l l L{0.14\textwidth} r l l r Y}
+\toprule
+\textbf{ID} & \textbf{Dataset} & \textbf{Shift Type} & \textbf{Sev.} & \textbf{Prompt} & \textbf{OOD} & \textbf{Conds.} & \textbf{Condition ID Format} \\
+\midrule
+\texttt{E1} & CIFAR-10 & \texttt{none} & 0 & \texttt{P0} & False & 1 & \texttt{E1} \\
+\texttt{E2} & CIFAR-10 & \texttt{prompt} & 0 & \texttt{P1} & False & 1 & \texttt{E2} \\
+\texttt{E3} & CIFAR-10-C & \texttt{visual} & 1 & \texttt{P0} & False & 6 & \texttt{E3::<corruption>::s1} \\
+\texttt{E4} & CIFAR-10-C & \texttt{visual} & 3 & \texttt{P0} & False & 6 & \texttt{E4::<corruption>::s3} \\
+\texttt{E5} & CIFAR-10-C & \texttt{visual} & 5 & \texttt{P0} & False & 6 & \texttt{E5::<corruption>::s5} \\
+\texttt{E6} & CIFAR-10-C & \texttt{visual+prompt} & 3 & \texttt{P1} & False & 6 & \texttt{E6::<corruption>::s3} \\
+\texttt{E7} & CIFAR-100 & \texttt{semantic} & 0 & \texttt{P0} & True & 1 & \texttt{E7} \\
+\texttt{E8} & SVHN & \texttt{far\_\allowbreak{}ood} & 0 & \texttt{P0} & True & 1 & \texttt{E8} \\
+\texttt{E9} & CIFAR-100 & \texttt{semantic+prompt} & 0 & \texttt{P1} & True & 1 & \texttt{E9} \\
+\texttt{E10} & SVHN & \texttt{far\_\allowbreak{}ood+prompt} & 0 & \texttt{P1} & True & 1 & \texttt{E10} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Evaluation and Postprocessing Implementation}
+
+\subsection{Fixed-Coverage and Risk-Constrained Selective Prediction}
+
+For any uncertainty method $m$ with calibration confidence vector $c_{\text{cal}} \in \mathbb{R}^{5000}$ and calibration correctness indicators $y_{\text{cal}} \in \{0, 1\}^{5000}$:
+\begin{itemize}
+  \item \textbf{Fixed-coverage threshold (\texttt{threshold\_\allowbreak{}for\_\allowbreak{}target\_\allowbreak{}coverage})}: For target coverage $\tau \in \{0.50, 0.70, 0.80, 0.90\}$, the threshold is the $(1 - \tau)$ empirical quantile of $c_{\text{cal}}$ using \texttt{method="lower"}:
+  \begin{equation}
+    \hat{t}(\tau) = \operatorname{Quantile}_{1-\tau}^{\text{lower}}(c_{\text{cal}}).
+  \end{equation}
+  \item \textbf{Risk-constrained threshold (\texttt{max\_\allowbreak{}coverage\_\allowbreak{}under\_\allowbreak{}risk})}: For target risk $r_{\max} \in \{0.05, 0.10\}$, calibration samples are sorted by descending confidence using a stable mergesort (\texttt{np.\allowbreak{}argsort(\allowbreak{}-c,\allowbreak{} kind="mergesort")}). Because selecting all samples with $c_i \ge t$ always includes entire tie blocks of identical confidence values, the function identifies the last index $e_b$ of every distinct tie block $b$, computes the cumulative error count $E(e_b) = \sum_{j=0}^{e_b} (1 - y_{\text{sorted},j})$ and prefix size $k_b = e_b + 1$, and computes the tie-block empirical risk:
+  \begin{equation}
+    \hat{R}_b = \frac{E(e_b)}{k_b}.
+  \end{equation}
+  If at least one block satisfies $\hat{R}_b \le r_{\max} + 10^{-12}$, the function returns the confidence value at the largest valid block index $b^*$ (maximizing calibration coverage). If no block satisfies the constraint, it returns $\operatorname{nextafter}(\max(c_{\text{cal}}), +\infty)$, which selects zero samples.
+  \item \textbf{Test-set selective evaluation (\texttt{selective\_\allowbreak{}metrics})}: Given test confidences $c_{\text{test}}$, correctness indicators $y_{\text{test}}$, and calibration threshold $\hat{t}$, the selected mask is $S = \{i : c_{\text{test},i} \ge \hat{t}\}$. Realized coverage is $|S| / N_{\text{test}}$, abstention rate is $1 - \text{coverage}$, and selective risk is $1 - \frac{1}{|S|} \sum_{i \in S} y_{\text{test},i}$ (or \texttt{np.\allowbreak{}nan} if $|S| = 0$).
+\end{itemize}
+
+\subsection{Risk-Coverage Curves, AURC, and EAURC}
+
+In \texttt{risk\_\allowbreak{}coverage\_\allowbreak{}curve(\allowbreak{}confidence,\allowbreak{} correct)}, test samples are sorted by descending confidence via \texttt{kind="mergesort"}. For each prefix size $k \in \{1, \dots, N\}$, the prefix coverage and prefix risk are:
+\begin{equation}
+  \text{cov}_k = \frac{k}{N}, \qquad \text{risk}_k = \frac{1}{k} \sum_{j=1}^{k} \left(1 - y_{\text{sorted},j}\right),
+\end{equation}
+with $(0.0, 0.0)$ prepended at the origin. \texttt{aurc} integrates the curve via \texttt{np.\allowbreak{}trapezoid(\allowbreak{}risk,\allowbreak{} coverage)}. \texttt{oracle\_\allowbreak{}aurc} computes the AURC when confidence is replaced by the binary correctness indicator $y \in \{0.0, 1.0\}$ (ranking all correct predictions ahead of all errors), and \texttt{eaurc} returns $\text{AURC} - \text{Oracle AURC}$.
+
+\subsection{OOD Discrimination and Calibration Metrics}
+
+For OOD conditions (\texttt{E7}--\texttt{E10}), clean CIFAR-10 (\texttt{E1}) test samples are labeled $0$ (in-distribution) and OOD samples are labeled $1$ (out-of-distribution), with higher uncertainty scores indicating higher OOD likelihood (\texttt{score\_\allowbreak{}orientation = "higher\_\allowbreak{}is\_\allowbreak{}more\_\allowbreak{}ood"}). \texttt{ood\_\allowbreak{}metrics(\allowbreak{}id\_\allowbreak{}u,\allowbreak{} ood\_\allowbreak{}u)} computes:
+\begin{itemize}
+  \item \textbf{AUROC}: \texttt{roc\_\allowbreak{}auc\_\allowbreak{}score(\allowbreak{}y,\allowbreak{} s)} over the concatenated binary labels $y$ and uncertainty scores $s$.
+  \item \textbf{AUPR-Out}: \texttt{average\_\allowbreak{}precision\_\allowbreak{}score(\allowbreak{}y,\allowbreak{} s)} with OOD as the positive class.
+  \item \textbf{FPR95 (\texttt{fpr95})}: Sets the threshold $\gamma_{0.05}$ to the 5th percentile of OOD uncertainty scores (\texttt{np.\allowbreak{}quantile(\allowbreak{}ood\_\allowbreak{}u,\allowbreak{} 0.\allowbreak{}05,\allowbreak{} method="linear")}) so that approximately 95\% of OOD inputs satisfy $\text{ood\_u} \ge \gamma_{0.05}$, and returns the fraction of ID inputs with $\text{id\_u} \ge \gamma_{0.05}$.
+\end{itemize}
+
+For in-distribution calibration evaluation on $N$ samples with probability matrix $P \in [0, 1]^{N \times K}$ and true labels $y \in \{0, \dots, K-1\}^N$:
+\begin{itemize}
+  \item \textbf{ECE (\texttt{ece\_\allowbreak{}score})}: Partitions $(0, 1]$ into $B = 15$ equal-width bins $(b_{m-1}, b_m]$ and computes $\sum_{m=1}^B \frac{|B_m|}{N} \left|\bar{c}(B_m) - \bar{a}(B_m)\right|$.
+  \item \textbf{NLL (\texttt{nll\_\allowbreak{}score})}: Computes $-\frac{1}{N} \sum_{i=1}^N \ln \max(P_{i, y_i}, 10^{-12})$.
+  \item \textbf{Multiclass Brier Score (\texttt{brier\_\allowbreak{}score\_\allowbreak{}multiclass})}: Computes $\frac{1}{N} \sum_{i=1}^N \sum_{c=0}^{K-1} (P_{i,c} - \mathbb{I}(y_i = c))^2$.
+\end{itemize}
+
+\subsection{Bootstrap Confidence Intervals and Failure-Case Extraction}
+
+Section 20 (Cell 46) computes 2,000-resample 95\% percentile bootstrap confidence intervals ($[q_{0.025}, q_{0.975}]$) for:
+\begin{itemize}
+  \item \texttt{risk\_\allowbreak{}at\_\allowbreak{}90} and \texttt{aurc} across primary ID conditions $\texttt{E1}, \texttt{E2}, \texttt{E4}, \texttt{E5}, \texttt{E6}$ (5 conditions $\times$ 5 seeds $\times$ 6 methods $\times$ 2 metrics = 300 CIs). Note that for \texttt{E4}, \texttt{E5}, and \texttt{E6}, \texttt{sample\_\allowbreak{}df[sample\_\allowbreak{}df.\allowbreak{}experiment\_\allowbreak{}id == exp\_\allowbreak{}id]} pools all 6 CIFAR-10-C corruptions ($N = 60,000$ samples per seed and method).
+  \item \texttt{auroc} across primary OOD conditions $\texttt{E7}$ and $\texttt{E8}$ (2 conditions $\times$ 5 seeds $\times$ 6 methods = 60 CIs), independently resampling $n_{\text{id}} = 10,000$ ID scores and $n_{\text{ood}}$ OOD scores with replacement on each replicate.
+\end{itemize}
+
+Section 22 (Cell 50) defines \texttt{extract\_\allowbreak{}failure\_\allowbreak{}cases(\allowbreak{}sample\_\allowbreak{}df,\allowbreak{} n\_\allowbreak{}each=25)}, which extracts the top 25 rows per \texttt{(\allowbreak{}experiment\_\allowbreak{}id,\allowbreak{} method)} group across six diagnostic categories: \texttt{high\_\allowbreak{}confidence\_\allowbreak{}wrong} (ID errors with highest confidence), \texttt{low\_\allowbreak{}confidence\_\allowbreak{}correct} (ID correct predictions with lowest confidence), \texttt{prompt\_\allowbreak{}instability} (highest \texttt{prompt\_\allowbreak{}instability}), \texttt{large\_\allowbreak{}conformal\_\allowbreak{}set} (largest \texttt{conformal\_\allowbreak{}set\_\allowbreak{}size}), \texttt{ood\_\allowbreak{}overconfidence} (OOD samples with lowest uncertainty), and \texttt{shift\_\allowbreak{}sensitive\_\allowbreak{}behavior} (shifted ID samples in \texttt{E2}--\texttt{E6} with the largest confidence drop relative to the same \texttt{(\allowbreak{}seed,\allowbreak{} method,\allowbreak{} sample\_\allowbreak{}id)} in \texttt{E1}), deduplicating the combined table and exporting 6,150 rows to \texttt{failure\_\allowbreak{}cases.\allowbreak{}csv}.
+
+\section{Output Generation and File Handling}
+
+Table~\ref{tab:outputs} summarizes all files written by the pipeline across \texttt{output/\allowbreak{}}, \texttt{tables/\allowbreak{}}, \texttt{figures/\allowbreak{}}, \texttt{metadata/\allowbreak{}}, and \texttt{final\_\allowbreak{}output/\allowbreak{}}.
+
+\begin{table}[!htbp]
+\centering
+\caption{Generated output files, formats, and directory locations.}
+\label{tab:outputs}
+\begin{tabularx}{\textwidth}{L{0.16\textwidth} L{0.28\textwidth} Y}
+\toprule
+\textbf{Directory} & \textbf{Filename(s)} & \textbf{Description and Schema} \\
+\midrule
+\texttt{output/\allowbreak{}} & \texttt{all\_\allowbreak{}results.\allowbreak{}csv} & 6,360-row condition-level summary table with 25 standardized columns (\texttt{RESULT\_\allowbreak{}COLUMNS}). \\
+\texttt{output/\allowbreak{}} & \texttt{per\_\allowbreak{}sample\_\allowbreak{}records.\allowbreak{}csv} & 9,961,920-row sample-level table recording predictions, confidences, uncertainties, prompt vote strings, conformal set sizes, and correctness. \\
+\texttt{tables/\allowbreak{}} & \texttt{risk\_\allowbreak{}at\_\allowbreak{}90\_\allowbreak{}coverage.\allowbreak{}csv}, \texttt{risk\_\allowbreak{}at\_\allowbreak{}80\_\allowbreak{}coverage.\allowbreak{}csv}, \texttt{risk\_\allowbreak{}at\_\allowbreak{}70\_\allowbreak{}coverage.\allowbreak{}csv}, \texttt{risk\_\allowbreak{}at\_\allowbreak{}50\_\allowbreak{}coverage.\allowbreak{}csv} & Mean, standard deviation, and seed count of selective risk at nominal 90\%, 80\%, 70\%, and 50\% coverage. \\
+\texttt{tables/\allowbreak{}} & \texttt{risk\_\allowbreak{}constrained\_\allowbreak{}coverage.\allowbreak{}csv} & Mean, standard deviation, and seed count of realized coverage under calibration risk bounds 5\% and 10\%. \\
+\texttt{tables/\allowbreak{}} & \texttt{calibration\_\allowbreak{}metrics.\allowbreak{}csv}, \texttt{ood\_\allowbreak{}metrics.\allowbreak{}csv}, \texttt{curve\_\allowbreak{}metrics.\allowbreak{}csv} & Grouped mean and standard deviation across seeds for ECE/NLL/Brier, AUROC/AUPR-Out/FPR95, and AURC/EAURC/full-risk. \\
+\texttt{tables/\allowbreak{}} & \texttt{main\_\allowbreak{}method\_\allowbreak{}comparison.\allowbreak{}csv}, \texttt{robustness\_\allowbreak{}table.\allowbreak{}csv} & Primary comparison tables for 90\%-coverage selective behavior and full risk-coverage curve summaries. \\
+\texttt{tables/\allowbreak{}} & \texttt{bootstrap\_\allowbreak{}95ci.\allowbreak{}csv}, \texttt{failure\_\allowbreak{}cases.\allowbreak{}csv} & 360-row 95\% bootstrap CI table and 6,150-row diagnostic failure-case table (plus 8 companion \texttt{.\allowbreak{}md} tables). \\
+\texttt{figures/\allowbreak{}} & \texttt{*.\allowbreak{}png}, \texttt{*.\allowbreak{}pdf} & 13 figure stems exported in both 200-DPI raster PNG and vector PDF formats (26 files total). \\
+\texttt{metadata/\allowbreak{}} & \texttt{split\_\allowbreak{}metadata.\allowbreak{}json}, \texttt{seed\_\allowbreak{}calibration\_\allowbreak{}parameters.\allowbreak{}json}, \texttt{experiment\_\allowbreak{}metadata.\allowbreak{}json}, \texttt{final\_\allowbreak{}validation\_\allowbreak{}checklist.\allowbreak{}csv} & Provenance, calibration parameters, split definitions, and the 34-row validation audit table. \\
+\texttt{final\_\allowbreak{}output/\allowbreak{}} & Mirror of \texttt{figures/\allowbreak{}}, \texttt{tables/\allowbreak{}}, \texttt{metadata/\allowbreak{}}, CSVs, and \texttt{completion\_\allowbreak{}summary.\allowbreak{}json} & Consolidated export directory archived into \texttt{/\allowbreak{}content/\allowbreak{}conformal\_\allowbreak{}vlm\_\allowbreak{}research\_\allowbreak{}artifacts.\allowbreak{}zip}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Error Handling, Reproducibility, and Execution Considerations}
+
+\subsection{Validation and Exception Handling}
+
+The codebase uses fail-fast exception handling for data and numerical invariants and defensive boolean aggregation for the final pipeline audit:
+\begin{itemize}
+  \item \textbf{Numerical finiteness and simplex validation}: \texttt{assert\_\allowbreak{}finite} and \texttt{validate\_\allowbreak{}probabilities} raise \texttt{ValueError} immediately if any embedding, logit, probability vector, or nonconformity score contains \texttt{NaN}/\texttt{Inf} or if softmax rows deviate from 1.0 by more than $10^{-5}$.
+  \item \textbf{Cache corruption recovery}: \texttt{load\_\allowbreak{}array\_\allowbreak{}cache} and \texttt{get\_\allowbreak{}condition\_\allowbreak{}logits} catch exceptions from unreadable or schema-mismatched cache files, log the reason, and recompute and overwrite the cache atomically via temporary \texttt{.\allowbreak{}tmp.\allowbreak{}npz} files.
+  \item \textbf{34-check integrated audit (\texttt{final\_\allowbreak{}validation})}: Section 25 evaluates 34 boolean checks covering Python version ($\ge 3.9$), device resolution, zero trainable model parameters, prompt keys, calibration split sizes and train/test disjointness, dataset/experiment/method coverage, result schema, finiteness of embeddings/logits/selective metrics/OOD metrics/calibration metrics/bootstrap CIs/conformal set sizes, row uniqueness in \texttt{summary\_\allowbreak{}df} and \texttt{sample\_\allowbreak{}df}, and presence of all required tables, figures, and metadata files. Cell 58 blocks final export if any check in \texttt{validation\_\allowbreak{}df["passed"]} is \texttt{False}.
+\end{itemize}
+
+\subsection{Reproducibility Controls}
+
+Reproducibility is controlled at four levels:
+\begin{enumerate}
+  \item \textbf{Global RNG seeding}: \texttt{set\_\allowbreak{}global\_\allowbreak{}seed(\allowbreak{}13)} seeds Python, NumPy, and PyTorch RNGs and enables deterministic CuDNN and PyTorch algorithm flags.
+  \item \textbf{Isolated split generators}: \texttt{make\_\allowbreak{}calibration\_\allowbreak{}split(\allowbreak{}seed)} instantiates an isolated \texttt{np.\allowbreak{}random.\allowbreak{}default\_\allowbreak{}rng(\allowbreak{}seed)} for each seed in \texttt{[13,\allowbreak{} 42,\allowbreak{} 123,\allowbreak{} 456,\allowbreak{} 765]}, ensuring that calibration indices depend only on \texttt{seed} and not on prior random calls.
+  \item \textbf{Deterministic tie-breaking}: All sorting operations in selective prediction and AURC calculation specify \texttt{kind="mergesort"} so tied confidence scores preserve sample order deterministically.
+  \item \textbf{Deterministic bootstrap seeds}: Bootstrap functions use isolated \texttt{np.\allowbreak{}random.\allowbreak{}default\_\allowbreak{}rng} instances seeded with \texttt{BOOTSTRAP\_\allowbreak{}SEED + seed} (for risk at 90\%), \texttt{BOOTSTRAP\_\allowbreak{}SEED + seed + 17} (for AURC), and \texttt{BOOTSTRAP\_\allowbreak{}SEED + seed + 101} (for OOD AUROC).
+\end{enumerate}
+Setting random seeds does not guarantee bit-identical floating-point logits across different GPU architectures or CUDA/cuDNN versions, particularly when FP16 automatic mixed precision (\texttt{use\_\allowbreak{}amp=True}) is active during \texttt{model.\allowbreak{}encode\_\allowbreak{}image}. Once embeddings and logits are cached in \texttt{cache/\allowbreak{}}, however, all downstream calibration, selective prediction, OOD evaluation, and bootstrap computations are deterministic on CPU.
+
+\section{Implementation Limitations}
+
+The following limitations and design constraints follow directly from inspection of the supplied source code:
+
+\begin{enumerate}
+  \item \textbf{Unscaled probabilities in conformal set construction}: In \texttt{fit\_\allowbreak{}seed\_\allowbreak{}calibration} (Section 12) and \texttt{evaluate\_\allowbreak{}seed\_\allowbreak{}condition} (Section 16), conformal nonconformity scores and prediction sets $C(x)$ are computed from the unscaled base softmax probabilities (\texttt{base["probs"]}) rather than temperature-scaled probabilities (\texttt{temp["probs"]}).
+  \item \textbf{Coarse discreteness of \texttt{prompt\_\allowbreak{}agreement} and \texttt{conformal\_\allowbreak{}set\_\allowbreak{}size}}: Because \texttt{prompt\_\allowbreak{}agreement} takes at most 4 distinct values ($\{0.25, 0.50, 0.75, 1.00\}$) and \texttt{conformal\_\allowbreak{}set\_\allowbreak{}size} confidence $1 / |C(x)|$ takes at most 10 distinct values, threshold selection via $\text{confidence} \ge \hat{t}$ selects entire tie blocks at once. Consequently, realized coverage can differ noticeably from nominal target coverage $\tau$.
+  \item \textbf{Seed and method pooling in Section 21 visualizations}: In Cell 48, calling \texttt{plot\_\allowbreak{}risk\_\allowbreak{}coverage(\allowbreak{}"E1")} and \texttt{plot\_\allowbreak{}risk\_\allowbreak{}coverage(\allowbreak{}"E2")} with the default \texttt{seed=None} (as well as the \texttt{E4} corruption plots) passes all 5 seeds' rows ($50,000$ rows per method) into \texttt{risk\_\allowbreak{}coverage\_\allowbreak{}curve}. In the same cell, \texttt{prompt\_\allowbreak{}agreement\_\allowbreak{}vs\_\allowbreak{}accuracy} and \texttt{conformal\_\allowbreak{}set\_\allowbreak{}size\_\allowbreak{}vs\_\allowbreak{}correctness} group \texttt{sample\_\allowbreak{}df[sample\_\allowbreak{}df.\allowbreak{}experiment\_\allowbreak{}id == "E1"]} without filtering to a single \texttt{method} per sample, averaging five primary-prompt correctness indicators with one majority-vote correctness indicator per sample.
+  \item \textbf{Unused helper functions retained for interface compatibility}: \texttt{evaluate\_\allowbreak{}condition\_\allowbreak{}experiment} in Cell 39 and the un-instrumented bootstrap helpers (\texttt{bootstrap\_\allowbreak{}ci\_\allowbreak{}scalar}, \texttt{bootstrap\_\allowbreak{}risk\_\allowbreak{}ci}, \texttt{bootstrap\_\allowbreak{}aurc\_\allowbreak{}ci}) in Cell 35 are defined in the codebase, while Cell 42 and Cell 46 invoke \texttt{get\_\allowbreak{}bank\_\allowbreak{}key} and the progress-aware bootstrap functions (\texttt{bootstrap\_\allowbreak{}risk\_\allowbreak{}ci\_\allowbreak{}progress}, \texttt{bootstrap\_\allowbreak{}aurc\_\allowbreak{}ci\_\allowbreak{}progress}, \texttt{bootstrap\_\allowbreak{}auroc\_\allowbreak{}ci\_\allowbreak{}progress}), respectively.
+  \item \textbf{High memory footprint of \texttt{sample\_\allowbreak{}df}}: Storing $9,961,920$ rows in \texttt{sample\_\allowbreak{}df} before writing \texttt{per\_\allowbreak{}sample\_\allowbreak{}records.\allowbreak{}csv} requires several gigabytes of system RAM.
+  \item \textbf{Hardcoded \texttt{/\allowbreak{}content} paths outside Colab}: When \texttt{IN\_\allowbreak{}COLAB} is \texttt{False}, \texttt{MY\_\allowbreak{}DRIVE} defaults to \texttt{Path(\allowbreak{}"/\allowbreak{}content")} and Cell 58 writes ZIP archives to \texttt{/\allowbreak{}content/\allowbreak{}*.\allowbreak{}zip}, which requires write permissions on \texttt{/\allowbreak{}content} unless modified.
+\end{enumerate}
+
+\section{Summary of the Implementation}
+
+The project implements a complete, cached evaluation pipeline for zero-shot CLIP \texttt{ViT-B/\allowbreak{}32} uncertainty quantification, selective abstention, and OOD detection across 30 experimental conditions and 5 seeds. By separating image and text embedding extraction from downstream statistical evaluation through fingerprinted \texttt{.\allowbreak{}npz} caches, enforcing train-only calibration splits (\texttt{CAL\_\allowbreak{}SPLITS}), and verifying all outputs through a 34-check audit (\texttt{final\_\allowbreak{}validation}), the codebase provides a self-contained implementation of post-hoc selective prediction under distribution shift.
+
+\appendix
+
+\section{Function and Class Interface Reference}
+
+\begin{small}
+\begin{longtable}{L{0.29\textwidth} L{0.26\textwidth} L{0.36\textwidth}}
+\caption{Summary of classes and functions defined in the codebase.}
+\label{tab:interfaces} \\
+\toprule
+\textbf{Identifier (Section)} & \textbf{Arguments / Return Type} & \textbf{Responsibility} \\
+\midrule
+\endfirsthead
+\multicolumn{3}{l}{\small\emph{Continued from previous page}} \\
+\toprule
+\textbf{Identifier (Section)} & \textbf{Arguments / Return Type} & \textbf{Responsibility} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{set\_\allowbreak{}global\_\allowbreak{}seed} (Sec.~2) & \texttt{(\allowbreak{}seed: int) -> None} & Seeds Python, NumPy, and PyTorch RNGs and sets deterministic flags. \\
+\texttt{seed\_\allowbreak{}numpy} (Sec.~2) & \texttt{(\allowbreak{}seed: int) -> Generator} & Returns an isolated NumPy \texttt{Generator} seeded with \texttt{seed}. \\
+\texttt{canonical\_\allowbreak{}json} (Sec.~3) & \texttt{(\allowbreak{}obj) -> str} & Serializes \texttt{obj} to key-sorted, compact JSON. \\
+\texttt{sha256\_\allowbreak{}text} (Sec.~3) & \texttt{(\allowbreak{}text: str) -> str} & Computes the hex SHA-256 digest of \texttt{text}. \\
+\texttt{config\_\allowbreak{}fingerprint} (Sec.~3) & \texttt{(\allowbreak{}extra: dict) -> str} & Returns a 16-char SHA-256 fingerprint over core config and \texttt{extra}. \\
+\texttt{assert\_\allowbreak{}finite} (Sec.~3) & \texttt{(\allowbreak{}name: str,\allowbreak{} arr: ndarray) -> None} & Raises \texttt{ValueError} if \texttt{arr} contains non-finite entries. \\
+\texttt{validate\_\allowbreak{}probabilities} (Sec.~3) & \texttt{(\allowbreak{}probs: ndarray,\allowbreak{} atol=1e-5) -> None} & Validates shape $[N, C]$, range $[0, 1]$, finiteness, and row sums $= 1$. \\
+\texttt{save\_\allowbreak{}array\_\allowbreak{}cache} (Sec.~3) & \texttt{(\allowbreak{}path,\allowbreak{} arrays,\allowbreak{} metadata) -> None} & Atomically writes \texttt{.\allowbreak{}npz} arrays and \texttt{.\allowbreak{}json} metadata. \\
+\texttt{load\_\allowbreak{}array\_\allowbreak{}cache} (Sec.~3) & \texttt{(\allowbreak{}path,\allowbreak{} expected\_\allowbreak{}fp) -> tuple | None} & Loads cached arrays and metadata if present and fingerprint matches. \\
+\texttt{save\_\allowbreak{}json} / \texttt{load\_\allowbreak{}or\_\allowbreak{}none\_\allowbreak{}json} (Sec.~3) & \texttt{(\allowbreak{}path,\allowbreak{} obj)} / \texttt{(\allowbreak{}path)} & Writes canonical JSON or safely loads JSON (returning \texttt{None} on error). \\
+\texttt{\_\allowbreak{}dataset\_\allowbreak{}present} (Sec.~4) & \texttt{(\allowbreak{}root,\allowbreak{} required\_\allowbreak{}paths) -> bool} & Checks whether all required dataset files exist under \texttt{root}. \\
+\texttt{download\_\allowbreak{}with\_\allowbreak{}progress} (Sec.~4) & \texttt{(\allowbreak{}url: str,\allowbreak{} output\_\allowbreak{}path: Path) -> None} & Downloads a URL via a \texttt{.\allowbreak{}part} file with a \texttt{tqdm} progress bar. \\
+\texttt{validate\_\allowbreak{}tar} (Sec.~4) & \texttt{(\allowbreak{}path: Path) -> bool} & Verifies that \texttt{path} is a non-empty, readable tar archive. \\
+\texttt{extract\_\allowbreak{}cifar10c\_\allowbreak{}tar} (Sec.~4) & \texttt{(\allowbreak{}) -> None} & Ensures all 6 CIFAR-10-C \texttt{.\allowbreak{}npy} files and \texttt{labels.\allowbreak{}npy} are extracted. \\
+\texttt{make\_\allowbreak{}calibration\_\allowbreak{}split} (Sec.~5) & \texttt{(\allowbreak{}seed,\allowbreak{} n\_\allowbreak{}total=50000,\allowbreak{} n\_\allowbreak{}cal=5000) -> ndarray} & Samples 5,000 unique sorted train indices without replacement. \\
+\texttt{build\_\allowbreak{}prompts} / \texttt{build\_\allowbreak{}all\_\allowbreak{}prompt\_\allowbreak{}texts} (Sec.~7) & \texttt{(\allowbreak{}class\_\allowbreak{}names,\allowbreak{} prompt\_\allowbreak{}key)} & Formats CIFAR-10 class names into prompt templates \texttt{P0}--\texttt{P3}. \\
+\texttt{get\_\allowbreak{}text\_\allowbreak{}embeddings} (Sec.~7) & \texttt{(\allowbreak{}prompt\_\allowbreak{}key: str) -> ndarray} & Computes or loads cached $(10, 512)$ L2-normalized CLIP text embeddings. \\
+\texttt{ArrayImageDataset} (Sec.~8) & \texttt{(\allowbreak{}images,\allowbreak{} labels,\allowbreak{} indices=None)} & Dataset wrapper for memory-mapped CIFAR-10-C numpy arrays. \\
+\texttt{TorchvisionImageDataset} (Sec.~8) & \texttt{(\allowbreak{}base\_\allowbreak{}dataset,\allowbreak{} label\_\allowbreak{}transform=None)} & Dataset wrapper applying CLIP \texttt{preprocess} to torchvision datasets. \\
+\texttt{cifar10\_\allowbreak{}clean\_\allowbreak{}dataset}, \texttt{cifar100\_\allowbreak{}dataset}, \texttt{svhn\_\allowbreak{}dataset}, \texttt{cifar10c\_\allowbreak{}dataset} (Sec.~8) & Dataset factory functions & Construct preprocessed dataset objects for train/test/OOD/corruption splits. \\
+\texttt{encode\_\allowbreak{}image\_\allowbreak{}dataset} (Sec.~9) & \texttt{(\allowbreak{}dataset,\allowbreak{} cache\_\allowbreak{}name,\allowbreak{} expected\_\allowbreak{}extra) -> tuple} & Encodes images into cached $(N, 512)$ L2-normalized CLIP embeddings. \\
+\texttt{compute\_\allowbreak{}prompt\_\allowbreak{}logits} (Sec.~9) & \texttt{(\allowbreak{}image\_\allowbreak{}embeddings,\allowbreak{} prompt\_\allowbreak{}embeddings) -> dict} & Computes scaled cosine similarity logits $(N, 10)$ for each prompt. \\
+\texttt{\_\allowbreak{}validate\_\allowbreak{}prompt\_\allowbreak{}logits\_\allowbreak{}bank} (Sec.~9) & \texttt{(\allowbreak{}logits,\allowbreak{} labels,\allowbreak{} embeddings,\allowbreak{} cache\_\allowbreak{}name) -> dict} & Validates prompt keys, array shapes, and finiteness of a logit bank. \\
+\texttt{get\_\allowbreak{}condition\_\allowbreak{}logits} (Sec.~9) & \texttt{(\allowbreak{}dataset\_\allowbreak{}key,\allowbreak{} dataset\_\allowbreak{}obj,\allowbreak{} cache\_\allowbreak{}name,\allowbreak{} extra)} & Loads or computes validated \texttt{(\allowbreak{}logits,\allowbreak{} labels,\allowbreak{} emb)} for a dataset split. \\
+\texttt{softmax\_\allowbreak{}np} (Sec.~11) & \texttt{(\allowbreak{}logits: ndarray) -> ndarray} & Numerically stable row-wise softmax in \texttt{float32}. \\
+\texttt{entropy\_\allowbreak{}np} (Sec.~11) & \texttt{(\allowbreak{}probs,\allowbreak{} normalized=False) -> ndarray} & Row-wise Shannon entropy (optionally divided by $\ln C$). \\
+\texttt{top12\_\allowbreak{}stats} (Sec.~11) & \texttt{(\allowbreak{}probs: ndarray) -> tuple} & Returns top-1 probability, top-2 probability, and top-1 minus top-2 margin. \\
+\texttt{prediction\_\allowbreak{}from\_\allowbreak{}probs} (Sec.~11) & \texttt{(\allowbreak{}probs: ndarray) -> ndarray} & Returns row-wise argmax class indices as \texttt{int64}. \\
+\texttt{confidence\_\allowbreak{}uncertainties} (Sec.~11) & \texttt{(\allowbreak{}logits: ndarray) -> dict} & Computes probabilities, predictions, MSP, entropy, margin, and uncertainties. \\
+\texttt{temperature\_\allowbreak{}scale\_\allowbreak{}logits} (Sec.~11) & \texttt{(\allowbreak{}logits,\allowbreak{} temperature: float) -> ndarray} & Divides logits by a positive finite scalar temperature. \\
+\texttt{fit\_\allowbreak{}temperature} (Sec.~12) & \texttt{(\allowbreak{}logits\_\allowbreak{}cal,\allowbreak{} labels\_\allowbreak{}cal,\allowbreak{} bounds) -> float} & Fits scalar temperature $T$ minimizing calibration NLL via bounded search. \\
+\texttt{fit\_\allowbreak{}seed\_\allowbreak{}calibration} (Sec.~12) & \texttt{(\allowbreak{}seed: int) -> dict} & Fits $T^{(s)}$ and split-conformal $\hat{q}_{1-\alpha}^{(s)}$ on the seed's calibration split. \\
+\texttt{prompt\_\allowbreak{}level\_\allowbreak{}outputs} (Sec.~13) & \texttt{(\allowbreak{}logits\_\allowbreak{}by\_\allowbreak{}prompt,\allowbreak{} return\_\allowbreak{}probs=False) -> tuple} & Vectorized majority-vote prediction, prompt agreement, and instability. \\
+\texttt{conformal\_\allowbreak{}sets} (Sec.~13) & \texttt{(\allowbreak{}probs: ndarray,\allowbreak{} qhat: float) -> tuple} & Constructs boolean conformal prediction sets and integer set sizes. \\
+\texttt{threshold\_\allowbreak{}for\_\allowbreak{}target\_\allowbreak{}coverage} (Sec.~14) & \texttt{(\allowbreak{}confidence\_\allowbreak{}cal,\allowbreak{} target: float) -> float} & Computes $(1 - \text{target})$ lower quantile threshold on calibration scores. \\
+\texttt{selective\_\allowbreak{}metrics} (Sec.~14) & \texttt{(\allowbreak{}confidence,\allowbreak{} correct,\allowbreak{} threshold) -> dict} & Computes coverage, selective risk, abstention rate, and answered count. \\
+\texttt{max\_\allowbreak{}coverage\_\allowbreak{}under\_\allowbreak{}risk} (Sec.~14) & \texttt{(\allowbreak{}confidence\_\allowbreak{}cal,\allowbreak{} correct\_\allowbreak{}cal,\allowbreak{} risk\_\allowbreak{}target) -> float} & Finds lowest tie-consistent threshold with calibration risk $\le \text{risk\_target}$. \\
+\texttt{risk\_\allowbreak{}coverage\_\allowbreak{}curve}, \texttt{aurc}, \texttt{oracle\_\allowbreak{}aurc}, \texttt{eaurc} (Sec.~14) & \texttt{(\allowbreak{}confidence,\allowbreak{} correct)} & Computes prefix risk-coverage curves, trapezoidal AURC, Oracle AURC, and EAURC. \\
+\texttt{fpr95}, \texttt{ood\_\allowbreak{}metrics} (Sec.~14) & \texttt{(\allowbreak{}id\_\allowbreak{}uncertainty,\allowbreak{} ood\_\allowbreak{}uncertainty)} & Computes FPR at 95\% OOD TPR, AUROC, and AUPR-Out. \\
+\texttt{ece\_\allowbreak{}score}, \texttt{nll\_\allowbreak{}score}, \texttt{brier\_\allowbreak{}score\_\allowbreak{}multiclass} (Sec.~14) & \texttt{(\allowbreak{}probs,\allowbreak{} labels[,\allowbreak{} bins])} & Computes Expected Calibration Error, multiclass NLL, and Brier score. \\
+\texttt{bootstrap\_\allowbreak{}ci\_\allowbreak{}scalar}, \texttt{bootstrap\_\allowbreak{}risk\_\allowbreak{}ci}, \texttt{bootstrap\_\allowbreak{}aurc\_\allowbreak{}ci} (Sec.~15) & Bootstrap helper functions & Compute percentile bootstrap CIs for scalar statistics, risk, and AURC. \\
+\texttt{evaluate\_\allowbreak{}seed\_\allowbreak{}condition} (Sec.~16) & \texttt{(\allowbreak{}seed,\allowbreak{} condition\_\allowbreak{}id,\allowbreak{} logits\_\allowbreak{}by\_\allowbreak{}prompt,\allowbreak{} .\allowbreak{}.\allowbreak{}.\allowbreak{})} & Evaluates all 6 uncertainty methods for one seed and condition. \\
+\texttt{evaluate\_\allowbreak{}condition\_\allowbreak{}experiment} (Sec.~17) & \texttt{(\allowbreak{}exp\_\allowbreak{}row) -> tuple} & Dispatches unexpanded experiment rows to \texttt{DATA\_\allowbreak{}BANK}. \\
+\texttt{expanded\_\allowbreak{}experiment\_\allowbreak{}matrix} (Sec.~18) & \texttt{(\allowbreak{}) -> pd.\allowbreak{}DataFrame} & Expands \texttt{E3}--\texttt{E6} across 6 corruptions to form the 30-row matrix. \\
+\texttt{get\_\allowbreak{}bank\_\allowbreak{}key} (Sec.~18) & \texttt{(\allowbreak{}row) -> str} & Maps any expanded matrix row to its \texttt{DATA\_\allowbreak{}BANK} key. \\
+\texttt{metric\_\allowbreak{}at\_\allowbreak{}target} (Sec.~19) & \texttt{(\allowbreak{}summary,\allowbreak{} target,\allowbreak{} metric) -> DataFrame} & Aggregates mean, std, and count across seeds at a fixed coverage target. \\
+\texttt{bootstrap\_\allowbreak{}risk\_\allowbreak{}ci\_\allowbreak{}progress}, \texttt{bootstrap\_\allowbreak{}aurc\_\allowbreak{}ci\_\allowbreak{}progress}, \texttt{bootstrap\_\allowbreak{}auroc\_\allowbreak{}ci\_\allowbreak{}progress} (Sec.~20) & Progress-bar bootstrap functions & Compute 2,000-resample 95\% CIs with \texttt{tqdm} progress bars. \\
+\texttt{save\_\allowbreak{}fig}, \texttt{plot\_\allowbreak{}risk\_\allowbreak{}coverage}, \texttt{reliability\_\allowbreak{}data} (Sec.~21) & Plotting helpers & Render and save publication figures in PNG and PDF formats. \\
+\texttt{extract\_\allowbreak{}failure\_\allowbreak{}cases} (Sec.~22) & \texttt{(\allowbreak{}sample\_\allowbreak{}df,\allowbreak{} n\_\allowbreak{}each=25) -> DataFrame} & Extracts top-25 diagnostic failure records across 6 categories. \\
+\texttt{\_\allowbreak{}safe\_\allowbreak{}has\_\allowbreak{}columns}, \texttt{\_\allowbreak{}safe\_\allowbreak{}nonempty}, \texttt{\_\allowbreak{}safe\_\allowbreak{}finite\_\allowbreak{}columns}, \texttt{\_\allowbreak{}safe\_\allowbreak{}unique\_\allowbreak{}rows}, \texttt{final\_\allowbreak{}validation} (Sec.~25) & Validation helpers & Execute the 34-check pipeline verification audit. \\
+\texttt{copy\_\allowbreak{}tree\_\allowbreak{}flat} (Sec.~26) & \texttt{(\allowbreak{}src\_\allowbreak{}dir: Path,\allowbreak{} dst\_\allowbreak{}dir: Path) -> int} & Recursively copies generated files into \texttt{final\_\allowbreak{}output/\allowbreak{}}. \\
+\end{longtable}
+\end{small}
+
+\section{Notebook Cell Inventory and Execution Map}
+
+\begin{small}
+\begin{longtable}{r l l r L{0.50\textwidth}}
+\caption{Complete cell-by-cell inventory of the 59-cell Jupyter notebook.}
+\label{tab:cells} \\
+\toprule
+\textbf{Cell} & \textbf{Type} & \textbf{Cell ID} & \textbf{Exec.} & \textbf{Section / Responsibility} \\
+\midrule
+\endfirsthead
+\multicolumn{5}{l}{\small\emph{Continued from previous page}} \\
+\toprule
+\textbf{Cell} & \textbf{Type} & \textbf{Cell ID} & \textbf{Exec.} & \textbf{Section / Responsibility} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+00 & Markdown & \texttt{502d5a7d} & -- & Title, project overview, and design invariants. \\
+01 & Markdown & \texttt{bc336630} & -- & Section 1 header: Environment and installation. \\
+02 & Code & \texttt{f15494b3} & 8 & \texttt{\%pip install} commands for dependencies and OpenAI CLIP. \\
+03 & Code & \texttt{bdd8d85d} & 9 & Top-level library imports and runtime/GPU environment summary. \\
+04 & Markdown & \texttt{41f82bd4} & -- & Section 2 header: Imports, configuration, and reproducibility. \\
+05 & Code & \texttt{3d413372} & 10 & Google Drive mount, \texttt{CONFIG}, \texttt{PROMPTS}, \texttt{EXPERIMENTS}, and \texttt{ROOTS}. \\
+06 & Code & \texttt{0e5cc294} & 11 & \texttt{set\_\allowbreak{}global\_\allowbreak{}seed} and \texttt{seed\_\allowbreak{}numpy} initialization. \\
+07 & Markdown & \texttt{b4a0d6cc} & -- & Section 3 header: Utility functions. \\
+08 & Code & \texttt{c48990ba} & 12 & Fingerprinting, validation, and atomic \texttt{.\allowbreak{}npz}/\texttt{.\allowbreak{}json} caching utilities. \\
+09 & Markdown & \texttt{43468ca0} & -- & Section 4 header: Dataset download, verification, and label definitions. \\
+10 & Code & \texttt{a8a63e89} & 13 & CIFAR-10, CIFAR-100, and SVHN dataset presence checks and loading. \\
+11 & Code & \texttt{58183184} & 14 & \texttt{CIFAR-10-C.\allowbreak{}tar} download, tar validation, and \texttt{.\allowbreak{}npy} extraction. \\
+12 & Code & \texttt{3c41d138} & 15 & CIFAR-10-C shape and test-label alignment verification across severities 1, 3, 5. \\
+13 & Markdown & \texttt{3012aa9a} & -- & Section 5 header: Data splits and leakage guardrails. \\
+14 & Code & \texttt{c11a5e1e} & 16 & \texttt{make\_\allowbreak{}calibration\_\allowbreak{}split}, \texttt{CAL\_\allowbreak{}SPLITS}, \texttt{TEST\_\allowbreak{}INDICES} offset check, \texttt{split\_\allowbreak{}metadata.\allowbreak{}json}. \\
+15 & Markdown & \texttt{5b7e3a96} & -- & Section 6 header: Model loading and preprocessing. \\
+16 & Code & \texttt{d4d2adbe} & 17 & Loads frozen CLIP \texttt{ViT-B/\allowbreak{}32} and verifies 0 trainable parameters. \\
+17 & Markdown & \texttt{b150a458} & -- & Section 7 header: Prompt construction. \\
+18 & Code & \texttt{6ccf9063} & 18 & \texttt{build\_\allowbreak{}prompts}, \texttt{build\_\allowbreak{}all\_\allowbreak{}prompt\_\allowbreak{}texts}, and \texttt{ALL\_\allowbreak{}PROMPT\_\allowbreak{}TEXTS}. \\
+19 & Code & \texttt{d45d812a} & 19 & \texttt{get\_\allowbreak{}text\_\allowbreak{}embeddings} and cached \texttt{TEXT\_\allowbreak{}EMBEDDINGS} dictionary. \\
+20 & Markdown & \texttt{c35c53a0} & -- & Section 8 header: Dataset adapters. \\
+21 & Code & \texttt{f38c63d6} & 20 & \texttt{ArrayImageDataset}, \texttt{TorchvisionImageDataset}, and dataset factory functions. \\
+22 & Markdown & \texttt{0ce4b653} & -- & Section 9 header: Efficient image inference and compatible cache. \\
+23 & Code & \texttt{b709b243} & 21 & \texttt{encode\_\allowbreak{}image\_\allowbreak{}dataset}, \texttt{compute\_\allowbreak{}prompt\_\allowbreak{}logits}, \texttt{\_\allowbreak{}validate\_\allowbreak{}prompt\_\allowbreak{}logits\_\allowbreak{}bank}, and \texttt{get\_\allowbreak{}condition\_\allowbreak{}logits}. \\
+24 & Markdown & \texttt{1d1f0783} & -- & Section 10 header: Load/cache the reusable inference bank. \\
+25 & Code & \texttt{3fa21cc8} & 22 & Constructs and validates \texttt{CALIBRATION\_\allowbreak{}BANK} and all 21 \texttt{DATA\_\allowbreak{}BANK} entries. \\
+26 & Markdown & \texttt{fb12ac61} & -- & Section 11 header: Stable probability, confidence, and uncertainty functions. \\
+27 & Code & \texttt{985fdf57} & 23 & \texttt{softmax\_\allowbreak{}np}, \texttt{entropy\_\allowbreak{}np}, \texttt{top12\_\allowbreak{}stats}, \texttt{confidence\_\allowbreak{}uncertainties}, and \texttt{temperature\_\allowbreak{}scale\_\allowbreak{}logits}. \\
+28 & Markdown & \texttt{41e613b6} & -- & Section 12 header: Temperature calibration on development data only. \\
+29 & Code & \texttt{5793b62c} & 26 & \texttt{fit\_\allowbreak{}temperature}, \texttt{fit\_\allowbreak{}seed\_\allowbreak{}calibration}, \texttt{SEED\_\allowbreak{}CALIBRATIONS}, and \texttt{seed\_\allowbreak{}calibration\_\allowbreak{}parameters.\allowbreak{}json}. \\
+30 & Markdown & \texttt{2bfcf765} & -- & Section 13 header: Prompt agreement, instability, and conformal prediction sets. \\
+31 & Code & \texttt{9675b85b} & 27 & Vectorized \texttt{prompt\_\allowbreak{}level\_\allowbreak{}outputs} and \texttt{conformal\_\allowbreak{}sets}. \\
+32 & Markdown & \texttt{e4bfd929} & -- & Section 14 header: Selective prediction, risk-coverage, AURC/EAURC, and OOD metrics. \\
+33 & Code & \texttt{32ba482b} & 28 & Selective, risk-coverage, AURC/EAURC, OOD, and calibration metric functions. \\
+34 & Markdown & \texttt{80c6e447} & -- & Section 15 header: Bootstrap confidence intervals. \\
+35 & Code & \texttt{41914806} & 29 & \texttt{bootstrap\_\allowbreak{}ci\_\allowbreak{}scalar}, \texttt{bootstrap\_\allowbreak{}risk\_\allowbreak{}ci}, and \texttt{bootstrap\_\allowbreak{}aurc\_\allowbreak{}ci}. \\
+36 & Markdown & \texttt{52e3616c} & -- & Section 16 header: Per-condition computation. \\
+37 & Code & \texttt{9b7f001d} & 30 & \texttt{METHODS} list and \texttt{evaluate\_\allowbreak{}seed\_\allowbreak{}condition}. \\
+38 & Markdown & \texttt{51146088} & -- & Section 17 header: Correct calibration reuse and per-sample record generation. \\
+39 & Code & \texttt{cd58f04e} & 35 & Precomputes \texttt{CAL\_\allowbreak{}FEATURES}, defines \texttt{RESULT\_\allowbreak{}COLUMNS} and \texttt{evaluate\_\allowbreak{}condition\_\allowbreak{}experiment}. \\
+40 & Markdown & \texttt{bd97936a} & -- & Section 18 header: Experiment matrix expansion and full execution. \\
+41 & Code & \texttt{4c314772} & 36 & \texttt{expanded\_\allowbreak{}experiment\_\allowbreak{}matrix} and 30-row \texttt{FULL\_\allowbreak{}MATRIX}. \\
+42 & Code & \texttt{7e7211e4} & 38 & Full experiment loop writing \texttt{all\_\allowbreak{}results.\allowbreak{}csv} and \texttt{per\_\allowbreak{}sample\_\allowbreak{}records.\allowbreak{}csv}. \\
+43 & Markdown & \texttt{128c9e92} & -- & Section 19 header: Derived tables and primary statistical summaries. \\
+44 & Code & \texttt{cd33f404} & 39 & \texttt{metric\_\allowbreak{}at\_\allowbreak{}target} and export of 8 CSV summary tables. \\
+45 & Markdown & \texttt{b6f553f6} & -- & Section 20 header: Bootstrap statistical analysis. \\
+46 & Code & \texttt{1f6952f7} & 41 & Progress-aware 2,000-resample bootstrap CIs writing \texttt{bootstrap\_\allowbreak{}95ci.\allowbreak{}csv}. \\
+47 & Markdown & \texttt{0e2ff856} & -- & Section 21 header: Publication-quality visualizations. \\
+48 & Code & \texttt{351e587c} & 42 & Generates 13 PNG and 13 PDF figures under \texttt{figures/\allowbreak{}}. \\
+49 & Markdown & \texttt{fbb67bb0} & -- & Section 22 header: Failure-case extraction. \\
+50 & Code & \texttt{c3b3ddaf} & 43 & \texttt{extract\_\allowbreak{}failure\_\allowbreak{}cases} exporting 6,150 rows to \texttt{failure\_\allowbreak{}cases.\allowbreak{}csv}. \\
+51 & Markdown & \texttt{f9378916} & -- & Section 23 header: Main, robustness, risk, calibration, OOD, and statistical tables. \\
+52 & Code & \texttt{274ea952} & 44 & Exports \texttt{main\_\allowbreak{}method\_\allowbreak{}comparison.\allowbreak{}csv}, \texttt{robustness\_\allowbreak{}table.\allowbreak{}csv}, and 8 Markdown tables. \\
+53 & Markdown & \texttt{ba274901} & -- & Section 24 header: Metadata, configuration, and result provenance. \\
+54 & Code & \texttt{4830c946} & 45 & Writes \texttt{experiment\_\allowbreak{}metadata.\allowbreak{}json}. \\
+55 & Markdown & \texttt{378d609b} & -- & Section 25 header: Integrated final validation and completeness audit. \\
+56 & Code & \texttt{2a7ac5bd} & 48 & \texttt{final\_\allowbreak{}validation(\allowbreak{})} 34-check audit and \texttt{final\_\allowbreak{}validation\_\allowbreak{}checklist.\allowbreak{}csv}. \\
+57 & Markdown & \texttt{1b6659da} & -- & Section 26 header: Final export and automatic downloads. \\
+58 & Code & \texttt{820406c0} & 49 & Copies deliverables to \texttt{final\_\allowbreak{}output/\allowbreak{}}, writes \texttt{completion\_\allowbreak{}summary.\allowbreak{}json}, and builds ZIPs. \\
+\end{longtable}
+\end{small}
+
+\end{document}

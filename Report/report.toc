@@ -1,0 +1,34 @@
+\contentsline {section}{\numberline {1}Introduction and Scope}{2}{section.1}%
+\contentsline {section}{\numberline {2}Project Structure and Software Dependencies}{3}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Repository File Inventory}{3}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}External Software and Dataset Dependencies}{4}{subsection.2.2}%
+\contentsline {section}{\numberline {3}Overall Implementation Workflow}{4}{section.3}%
+\contentsline {section}{\numberline {4}Input Data and Preparation}{6}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Dataset Specifications and Storage Layout}{6}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Verification, Slicing, and Preprocessing}{7}{subsection.4.2}%
+\contentsline {section}{\numberline {5}Main Components}{7}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Utility, Split, and Prompt Components (Sections 2--7)}{7}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Inference, Calibration, and Metric Components (Sections 9--16)}{8}{subsection.5.2}%
+\contentsline {section}{\numberline {6}Model and Algorithm Implementation}{9}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Zero-Shot CLIP Similarity and Base Probabilities}{9}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Base Confidence and Uncertainty Scores (\texttt {MSP}, \texttt {entropy}, \texttt {margin})}{9}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}Post-Hoc Temperature Scaling (\texttt {temperature\_\allowbreak {}MSP})}{9}{subsection.6.3}%
+\contentsline {subsection}{\numberline {6.4}Multi-Prompt Agreement and Instability (\texttt {prompt\_\allowbreak {}agreement})}{10}{subsection.6.4}%
+\contentsline {subsection}{\numberline {6.5}Split-Conformal Prediction Sets (\texttt {conformal\_\allowbreak {}set\_\allowbreak {}size})}{10}{subsection.6.5}%
+\contentsline {section}{\numberline {7}Calibration and Inference Processing Procedure}{11}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Two-Stage Caching Architecture}{11}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Per-Seed Calibration and Evaluation Workflow}{11}{subsection.7.2}%
+\contentsline {section}{\numberline {8}Configuration and Parameter Handling}{13}{section.8}%
+\contentsline {section}{\numberline {9}Evaluation and Postprocessing Implementation}{13}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Fixed-Coverage and Risk-Constrained Selective Prediction}{13}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Risk-Coverage Curves, AURC, and EAURC}{14}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}OOD Discrimination and Calibration Metrics}{14}{subsection.9.3}%
+\contentsline {subsection}{\numberline {9.4}Bootstrap Confidence Intervals and Failure-Case Extraction}{14}{subsection.9.4}%
+\contentsline {section}{\numberline {10}Output Generation and File Handling}{15}{section.10}%
+\contentsline {section}{\numberline {11}Error Handling, Reproducibility, and Execution Considerations}{15}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Validation and Exception Handling}{15}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}Reproducibility Controls}{15}{subsection.11.2}%
+\contentsline {section}{\numberline {12}Implementation Limitations}{17}{section.12}%
+\contentsline {section}{\numberline {13}Summary of the Implementation}{17}{section.13}%
+\contentsline {section}{\numberline {A}Function and Class Interface Reference}{18}{appendix.A}%
+\contentsline {section}{\numberline {B}Notebook Cell Inventory and Execution Map}{20}{appendix.B}%
